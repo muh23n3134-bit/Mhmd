@@ -133,25 +133,23 @@ class ProChan : HttpSource() {
         }
     }
 
-    override fun fetchPageList(chapter: SChapter): rx.Observable<List<Page>> {
-        return client.asObservableSuccess(GET(baseUrl + chapter.url, headers))
-            .map { response ->
-                val data = response.extractNextJs<Data<ChapterDetails>>()?.data
-                    ?: response.extractNextJsRsc<Data<ChapterDetails>>()?.data
-                    ?: throw Exception("Failed to parse pages")
+    override fun fetchPageList(chapter: SChapter): rx.Observable<List<Page>> = client.asObservableSuccess(GET(baseUrl + chapter.url, headers))
+        .map { response ->
+            val data = response.extractNextJs<Data<ChapterDetails>>()?.data
+                ?: response.extractNextJsRsc<Data<ChapterDetails>>()?.data
+                ?: throw Exception("Failed to parse pages")
 
-                countView(data.id)
+            countView(data.id)
 
-                data.images.mapIndexed { index, image ->
-                    val url = if (image is ScrambledImage) {
-                        baseUrl + chapter.url + "#" + image.toJsonString()
-                    } else {
-                        (image as Url).url
-                    }
-                    Page(index, "", url)
+            data.images.mapIndexed { index, image ->
+                val url = if (image is ScrambledImage) {
+                    baseUrl + chapter.url + "#" + image.toJsonString()
+                } else {
+                    (image as Url).url
                 }
+                Page(index, "", url)
             }
-    }
+        }
 
     private fun imageIntercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -202,6 +200,7 @@ class ProChan : HttpSource() {
                     override fun onResponse(call: Call, response: Response) {
                         response.closeQuietly()
                     }
+
                     override fun onFailure(call: Call, e: okio.IOException) {
                         Log.e(name, "Failed to count views", e)
                     }
@@ -216,14 +215,12 @@ class ProChan : HttpSource() {
     override fun searchMangaParse(response: Response) = throw UnsupportedOperationException()
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 
-    private fun parseDate(dateStr: String): Long {
-        return try {
-            Calendar.getInstance().apply {
-                time = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US).parse(dateStr)!!
-            }.timeInMillis
-        } catch (e: Exception) {
-            0L
-        }
+    private fun parseDate(dateStr: String): Long = try {
+        Calendar.getInstance().apply {
+            time = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US).parse(dateStr)!!
+        }.timeInMillis
+    } catch (e: Exception) {
+        0L
     }
 
     companion object {

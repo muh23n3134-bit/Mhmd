@@ -70,12 +70,11 @@ class ProChan : HttpSource() {
             ),
         )
         .build()
-
-        override fun headersBuilder() = super.headersBuilder()
+    override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-
+    
     private val rscHeaders = headersBuilder()
         .set("rsc", "1")
         .build()
@@ -587,18 +586,15 @@ class ProChan : HttpSource() {
 
     private fun countViews(seriesId: String, chapterId: String? = null) {
         val userAgent = headers["User-Agent"]!!
-        val payload = ViewsDto(
+                val payload = ViewsDto(
             chapterId = chapterId?.toInt(),
             contentId = seriesId.toInt(),
-                        deviceType = when {
+            deviceType = when {
                 MOBILE_REGEX.containsMatchIn(userAgent) -> 2
                 TABLES_REGEX.containsMatchIn(userAgent) -> 3
                 else -> 1
             },
-            surface = when {
-                chapterId == null -> 1
-                else -> 2
-            },
+
         ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
 
         client.newCall(POST("$baseUrl/api/views", headers, payload))

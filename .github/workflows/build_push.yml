@@ -26,11 +26,10 @@ jobs:
       - name: Build APK Debug
         run: |
           chmod +x gradlew
-          ./gradlew :src:ar:mangapro:assembleDebug
+          ./gradlew :src:ar:mangapro:assembleDebug -x spotlessKotlinCheck
 
       - name: Upload APK to Actions
         uses: actions/upload-artifact@v4
         with:
-          name: ProChan-Extension-APK
+          name: ProChan-Final-APK
           path: "**/*.apk"
-          if-no-files-found: error

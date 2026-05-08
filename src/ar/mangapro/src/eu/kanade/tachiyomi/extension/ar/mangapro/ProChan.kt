@@ -586,15 +586,18 @@ class ProChan : HttpSource() {
 
     private fun countViews(seriesId: String, chapterId: String? = null) {
         val userAgent = headers["User-Agent"]!!
-                val payload = ViewsDto(
+        val payload = ViewsDto(
             chapterId = chapterId?.toInt(),
             contentId = seriesId.toInt(),
             deviceType = when {
-                MOBILE_REGEX.containsMatchIn(userAgent) -> 2
-                TABLES_REGEX.containsMatchIn(userAgent) -> 3
-                else -> 1
+                MOBILE_REGEX.containsMatchIn(userAgent) -> "mobile"
+                TABLES_REGEX.containsMatchIn(userAgent) -> "tablet"
+                else -> "desktop"
             },
-
+            surface = when {
+                chapterId == null -> "series"
+                else -> "chapter"
+            },
         ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
 
         client.newCall(POST("$baseUrl/api/views", headers, payload))

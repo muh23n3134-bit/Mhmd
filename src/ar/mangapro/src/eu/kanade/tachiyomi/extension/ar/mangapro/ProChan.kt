@@ -73,8 +73,12 @@ class ProChan : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
-        .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-    
+        .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36")
+        .set("sec-ch-ua", "\"Chromium\";v=\"145\", \"Google Chrome\";v=\"145\", \"Not-A.Brand\";v=\"99\"")
+        .set("sec-ch-ua-mobile", "?1")
+        .set("sec-ch-ua-platform", "\"Android\"")
+        .set("sec-ch-ua-model", "\"Infinix X688B\"")
+        
     private val rscHeaders = headersBuilder()
         .set("rsc", "1")
         .build()

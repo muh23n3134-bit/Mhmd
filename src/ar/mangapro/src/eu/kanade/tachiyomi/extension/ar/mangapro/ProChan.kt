@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.widget.Toast
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -34,34 +33,31 @@ class ProChan :
     ConfigurableSource {
 
     override val name = "ProChan"
-
     override val lang = "ar"
-
     override val supportsLatest = true
-
     override val baseUrl by lazy { getPrefBaseUrl() }
-
     private val preferences by getPreferencesLazy()
-
     private val apiBaseUrl = "https://procomic.pro/api/public"
-
     override val versionId = 6
+
+    override val client = network.cloudflareClient.newBuilder()
+        .rateLimit(2) 
+        .addInterceptor(::scrambledImageInterceptor)
+        .build()
+
+    override fun headersBuilder() = super.headersBuilder()
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+        .add("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+        .add("Referer", "$baseUrl/")
 
     private val apiHeaders: Headers by lazy {
         headersBuilder()
-            .add("Accept", "application/json, text/plain, */*")
-            .add("Origin", baseUrl)
-            .add("Referer", "$baseUrl/")
-            .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+            .add("X-Requested-With", "XMLHttpRequest")
+            .set("Accept", "application/json, text/plain, */*")
             .build()
     }
 
-    override val client = super.client.newBuilder()
-        .addInterceptor(::scrambledImageInterceptor)
-        .rateLimit(1)
-        .build()
-
-    // Popular
     override fun popularMangaRequest(page: Int): Request {
         val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
             .addQueryParameter("sort", "latest")
@@ -70,9 +66,8 @@ class ProChan :
         return GET(url, apiHeaders)
     }
 
-    override fun popularMangaParse(response: Response) = latestUpdatesParse(response)
+    override fun popularMangaParse(response: Response): MangasPage = latestUpdatesParse(response)
 
-    // Latest
     override fun latestUpdatesRequest(page: Int): Request {
         val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
             .addQueryParameter("sort", "latest_chapter")
@@ -82,6 +77,7 @@ class ProChan :
     }
 
     override fun latestUpdatesParse(response: Response): MangasPage {
+        if (response.code == 403) throw Exception("خطأ 403: يرجى فتح الموقع في WebView لتجاوز الحماية")
         val data = response.parseAs<MetaData<BrowseManga>>()
         val mangas = data.data.map { manga ->
             SManga.create().apply {
@@ -93,7 +89,6 @@ class ProChan :
         return MangasPage(mangas, data.meta.hasNextPage())
     }
 
-    // Search
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         if (query.isNotBlank()) {
             val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
@@ -107,13 +102,7 @@ class ProChan :
 
     override fun searchMangaParse(response: Response) = latestUpdatesParse(response)
 
-    // Details
-    override fun mangaDetailsRequest(manga: SManga): Request {
-        val url = "$apiBaseUrl/series/".toHttpUrl().newBuilder()
-            .addPathSegment(manga.url)
-            .build()
-        return GET(url, apiHeaders)
-    }
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBaseUrl/series/${manga.url}", apiHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga = response.parseAs<Series>().series.let { manga ->
         SManga.create().apply {
@@ -126,15 +115,10 @@ class ProChan :
         }
     }
 
-    // Chapters
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/series/${manga.url}"
-
     override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl/series/${manga.url}", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val html = response.body.string()
-        val document = Jsoup.parse(html)
-        // استخراج البيانات من الـ Script لأن الموقع يستخدم Next.js
+        val document = Jsoup.parse(response.body.string())
         val scriptData = document.select("script:containsData(initialChapters)").firstOrNull()?.data()
             ?: return emptyList()
         
@@ -149,39 +133,27 @@ class ProChan :
                     } catch (e: Exception) { 0L }
                 }
             }
-        } catch (e: Exception) {
-            emptyList()
-        }
+        } catch (e: Exception) { emptyList() }
     }
-
-    // Pages
-    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl/chapter/${chapter.url}"
 
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl/chapter/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
-        val document = Jsoup.parse(html)
+        val document = Jsoup.parse(response.body.string())
         val scriptData = document.select("script:containsData(\"images\")").firstOrNull()?.data()
             ?: return emptyList()
 
         return try {
             val imageData = scriptData.parseAs<Images>()
-            imageData.images.mapIndexed { i, url ->
-                Page(i, imageUrl = url)
-            }
-        } catch (e: Exception) {
-            emptyList()
-        }
+            imageData.images.mapIndexed { i, url -> Page(i, imageUrl = url) }
+        } catch (e: Exception) { emptyList() }
     }
 
-    // Image Interceptor (For ProChan specific scrambling if needed)
     private fun scrambledImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (request.url.host != "scrambled") return chain.proceed(request)
         val scrambledImage = request.url.fragment!!.parseAs<ScrambledImage>()
         val resultBitmap = Bitmap.createBitmap(scrambledImage.dim[0], scrambledImage.dim[1], Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(resultBitmap)
         val stream = Buffer()
         resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream.outputStream())
         return Response.Builder()
@@ -190,9 +162,8 @@ class ProChan :
             .build()
     }
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
-    // Preference
     companion object {
         internal val apiDateFormat by lazy {
             SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
@@ -207,7 +178,6 @@ class ProChan :
         val baseUrlPref = androidx.preference.EditTextPreference(screen.context).apply {
             key = BASE_URL_PREF
             title = "Override BaseUrl"
-            summary = "For temporary uses."
             setDefaultValue(DEFAULT_BASE_URL)
         }
         screen.addPreference(baseUrlPref)

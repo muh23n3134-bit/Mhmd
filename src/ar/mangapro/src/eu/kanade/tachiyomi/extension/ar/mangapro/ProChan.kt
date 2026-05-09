@@ -16,7 +16,6 @@ import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.extractNextJsRsc
 import keiyoushi.utils.firstInstance
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import okhttp3.Call
 import okhttp3.Callback
@@ -25,7 +24,6 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.internal.closeQuietly
@@ -62,17 +60,17 @@ class ProChan : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
-        .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36")
-        .set("X-Requested-With", "XMLHttpRequest")
-        .set("X-Nextjs-Data", "1")
-        .set("Accept", "text/x-component, application/json, text/plain, */*")
-        .set("sec-ch-ua", "\"Chromium\";v=\"145\", \"Google Chrome\";v=\"145\", \"Not-A.Brand\";v=\"99\"")
+        .set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+        .set("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
+        .set("sec-ch-ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
         .set("sec-ch-ua-mobile", "?1")
         .set("sec-ch-ua-platform", "\"Android\"")
         .set("sec-ch-ua-model", "\"Infinix X688B\"")
 
     private val rscHeaders = headersBuilder()
         .set("rsc", "1")
+        .set("Accept", "text/x-component")
         .build()
 
     override fun popularMangaRequest(page: Int): Request = searchMangaRequest(page, "", getFilterList().apply { firstInstance<SortFilter>().state = 2 })
@@ -99,9 +97,14 @@ class ProChan : HttpSource() {
             addQueryParameter("limit", "18")
             addQueryParameter("page", page.toString())
             if (query.isNotBlank()) addQueryParameter("search", query)
-            addQueryParameter("sort", filters.firstInstance<SortFilter>().selected)
+            val sort = filters.firstInstance<SortFilter>().selected
+            addQueryParameter("sort", sort)
         }.build()
-        return GET(url, headers)
+        
+        return Request.Builder()
+            .url(url)
+            .headers(headersBuilder().set("X-Requested-With", "XMLHttpRequest").build())
+            .build()
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
@@ -111,7 +114,10 @@ class ProChan : HttpSource() {
                 url = "/series/${manga.type}/${manga.id}/${manga.slug}"
                 title = manga.title
                 thumbnail_url = (manga.coverImageApp?.desktop ?: manga.coverImage)?.let {
-                    if (it.startsWith("/")) manga.cdn?.let { cdn -> "https://$cdn.$domain$it" } else it
+                    if (it.startsWith("/")) {
+                        val cdnHost = manga.cdn ?: "cdn"
+                        "https://$cdnHost.$domain$it"
+                    } else it
                 }
             }
         }
@@ -121,7 +127,7 @@ class ProChan : HttpSource() {
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val seriesData = response.extractNextJs<Series>() ?: throw IOException("Failed to parse series data")
+        val seriesData = response.extractNextJs<Series>() ?: throw IOException("خطأ في جلب بيانات المانجا - تحقق من WebView")
         val manga = seriesData.series
         return SManga.create().apply {
             url = "/series/${manga.type}/${manga.id}/${manga.slug}"
@@ -136,7 +142,10 @@ class ProChan : HttpSource() {
                 else -> SManga.UNKNOWN
             }
             thumbnail_url = (manga.coverImageApp?.desktop ?: manga.metadata.coverImage)?.let {
-                if (it.startsWith("/")) manga.cdn?.let { cdn -> "https://$cdn.$domain$it" } else it
+                if (it.startsWith("/")) {
+                    val cdnHost = manga.cdn ?: "cdn"
+                    "https://$cdnHost.$domain$it"
+                } else it
             }
             initialized = true
         }
@@ -164,12 +173,19 @@ class ProChan : HttpSource() {
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
-        val imageData = response.body.string().extractNextJsRsc<Images>() ?: return emptyList()
+        val body = response.body.string()
+        val imageData = body.extractNextJsRsc<Images>() ?: return emptyList()
         val chapterUrl = response.request.url.toString()
         return imageData.images.mapIndexed { i, url -> Page(i, chapterUrl, url) }
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headersBuilder().set("Referer", page.url).build())
+    override fun imageRequest(page: Page): Request {
+        val imageHeaders = headersBuilder()
+            .set("Referer", page.url)
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .build()
+        return GET(page.imageUrl!!, imageHeaders)
+    }
 
     private fun scrambledImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -185,23 +201,9 @@ class ProChan : HttpSource() {
             .build()
     }
 
-    private fun countViews(seriesId: String, chapterId: String? = null) {
-        val payload = ViewsDto(
-            chapterId = chapterId?.toInt(),
-            contentId = seriesId.toInt(),
-            deviceType = "mobile",
-            surface = if (chapterId == null) "series" else "chapter",
-        ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
-        client.newCall(POST("$baseUrl/api/views", headers, payload)).enqueue(object : Callback {
-            override fun onResponse(call: Call, response: Response) { response.closeQuietly() }
-            override fun onFailure(call: Call, e: IOException) {}
-        })
-    }
-
     override fun getFilterList() = FilterList(SortFilter(), TypeFilter(), YearFilter(), StatusFilter(), GenreFilter(), TagFilter())
 
     companion object {
-        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val SUPPORTED_TYPES = listOf("manga", "manhwa", "manhua")
     }
 }

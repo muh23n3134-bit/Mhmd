@@ -2,11 +2,9 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.util.Log
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
-import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -20,10 +18,6 @@ import keiyoushi.utils.firstInstance
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.runBlocking
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -33,20 +27,14 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.asResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.internal.closeQuietly
 import okio.Buffer
 import rx.Observable
-import tachiyomi.decoder.ImageDecoder
 import java.io.IOException
-import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
-import kotlin.io.encoding.Base64
 
 class ProChan : HttpSource() {
     override val name = "ProChan"
@@ -93,6 +81,18 @@ class ProChan : HttpSource() {
     override fun latestUpdatesParse(response: Response): MangasPage = searchMangaParse(response)
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        return client.newCall(popularMangaRequest(page))
+            .asObservableSuccess()
+            .map { response -> popularMangaParse(response) }
+    }
+
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
+        return client.newCall(latestUpdatesRequest(page))
+            .asObservableSuccess()
+            .map { response -> latestUpdatesParse(response) }
+    }
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/api/public/series/search".toHttpUrl().newBuilder().apply {
             addQueryParameter("status", "approved")
@@ -121,7 +121,8 @@ class ProChan : HttpSource() {
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val manga = response.extractNextJs<Series>()!!.series
+        val seriesData = response.extractNextJs<Series>() ?: throw IOException("Failed to parse series data")
+        val manga = seriesData.series
         return SManga.create().apply {
             url = "/series/${manga.type}/${manga.id}/${manga.slug}"
             title = manga.title
@@ -144,7 +145,7 @@ class ProChan : HttpSource() {
     override fun chapterListRequest(manga: SManga) = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val data = response.extractNextJs<InitialChapters>()!!
+        val data = response.extractNextJs<InitialChapters>() ?: return emptyList()
         val type = response.request.url.pathSegments[1]
         val id = response.request.url.pathSegments[2]
         val slug = response.request.url.pathSegments[3]
@@ -180,8 +181,21 @@ class ProChan : HttpSource() {
         resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream.outputStream())
         return Response.Builder()
             .request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
-            .body(stream.readByteString().asResponseBody("image/png".toMediaType()))
+            .body(stream.readByteString().toResponseBody("image/png".toMediaType()))
             .build()
+    }
+
+    private fun countViews(seriesId: String, chapterId: String? = null) {
+        val payload = ViewsDto(
+            chapterId = chapterId?.toInt(),
+            contentId = seriesId.toInt(),
+            deviceType = "mobile",
+            surface = if (chapterId == null) "series" else "chapter",
+        ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
+        client.newCall(POST("$baseUrl/api/views", headers, payload)).enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) { response.closeQuietly() }
+            override fun onFailure(call: Call, e: IOException) {}
+        })
     }
 
     override fun getFilterList() = FilterList(SortFilter(), TypeFilter(), YearFilter(), StatusFilter(), GenreFilter(), TagFilter())

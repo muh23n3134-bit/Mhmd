@@ -3,7 +3,6 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.Rect
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -15,152 +14,150 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.parseAs
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import okio.Buffer
 import org.jsoup.Jsoup
 import java.io.ByteArrayOutputStream
+import uy.kohesive.injekt.injectLazy
 
-class ProChan :
-    HttpSource(),
-    ConfigurableSource {
+class ProChan : HttpSource(), ConfigurableSource {
 
     override val name = "ProChan"
     override val lang = "ar"
     override val supportsLatest = true
     override val baseUrl by lazy { getPrefBaseUrl() }
     private val preferences by getPreferencesLazy()
-    override val versionId = 15
+    private val json: Json by injectLazy()
 
     override val client = network.cloudflareClient.newBuilder()
         .rateLimit(1)
-        .addInterceptor(::scrambledImageInterceptor)
+        .addInterceptor(::imageStitchingInterceptor)
         .build()
 
     override fun headersBuilder() = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36")
         .add("Referer", "$baseUrl/")
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/series?page=$page", headers)
-
+    // --- Popular & Latest ---
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/api/public/content/latest-updates?limit=18&page=$page", headers)
+    
     override fun popularMangaParse(response: Response): MangasPage {
-        val document = Jsoup.parse(response.body.string())
-        val mangas = document.select("a[href*=/series/]").mapNotNull { element ->
-            val titleText = element.select("h3, h2, p").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
-            if (titleText == null) return@mapNotNull null
+        val jsonString = response.body.string()
+        val jsonObject = json.decodeFromString<JsonObject>(jsonString)
+        val data = jsonObject["data"]?.jsonArray ?: return MangasPage(emptyList(), false)
+        
+        val mangas = data.map { element ->
+            val item = element.jsonObject
             SManga.create().apply {
-                url = element.attr("href").removePrefix(baseUrl)
-                title = titleText
-                thumbnail_url = element.select("img").attr("abs:src")
+                url = "/series/${item["type"]?.jsonPrimitive?.content}/${item["id"]?.jsonPrimitive?.content}/${item["slug"]?.jsonPrimitive?.content}"
+                title = item["title"]?.jsonPrimitive?.content ?: ""
+                thumbnail_url = item["poster"]?.jsonPrimitive?.content
             }
-        }.distinctBy { it.url }
-
-        return MangasPage(mangas, mangas.size >= 15)
+        }
+        return MangasPage(mangas, mangas.size >= 18)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/updates?page=$page", headers)
+    override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/series".toHttpUrl().newBuilder().apply {
-            addQueryParameter("page", page.toString())
-            if (query.isNotBlank()) addQueryParameter("search", query)
-            filters.forEach { filter ->
-                when (filter) {
-                    is SortFilter -> addQueryParameter("sort", filter.selected)
-                    is TypeFilter -> filter.selected?.let { addQueryParameter("type", it) }
-                    is StatusFilter -> filter.selected?.let { addQueryParameter("status", it) }
-                    is YearFilter -> filter.selected?.let { addQueryParameter("year", it) }
-                    else -> {}
-                }
-            }
-        }.build()
-        return GET(url, headers)
-    }
-
+    // --- Search ---
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = popularMangaRequest(page) // يمكن تطويره لاحقاً
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
+    // --- Details ---
     override fun mangaDetailsParse(response: Response): SManga {
         val document = Jsoup.parse(response.body.string())
         return SManga.create().apply {
             title = document.select("h1").text().trim()
-            description = document.select("p.text-sm.line-clamp-6, div.description").text().trim()
-            thumbnail_url = document.select("img[alt=poster], img.object-cover").firstOrNull()?.attr("abs:src") ?: ""
-            author = document.select("div:contains(المؤلف) + div, span:contains(المؤلف) + span").text().trim()
-            genre = document.select("div.flex.wrap a[href*=genres], a[href*=category]").joinToString { it.text() }
-            status = when {
-                document.text().contains("مستمر") -> SManga.ONGOING
-                document.text().contains("مكتمل") -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
-            initialized = true
+            description = document.select("p").text().trim()
+            thumbnail_url = document.select("img").firstOrNull()?.attr("abs:src") ?: ""
         }
+    }
+
+    // --- Chapters (تم التعديل لاستخدام الـ API الجديد) ---
+    override fun chapterListRequest(manga: SManga): Request {
+        val mangaId = manga.url.split("/")[3] // استخراج الرقم (مثل 34) من الرابط
+        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?limit=100&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val document = Jsoup.parse(response.body.string())
-        return document.select("a[href*=/chapter/]").map { element ->
+        val jsonString = response.body.string()
+        val jsonObject = json.decodeFromString<JsonObject>(jsonString)
+        val chaptersData = jsonObject["data"]?.jsonArray ?: return emptyList()
+
+        return chaptersData.map { element ->
+            val item = element.jsonObject
             SChapter.create().apply {
-                url = element.attr("href").removePrefix(baseUrl)
-                name = element.text().trim()
+                url = "${response.request.url}/chapter/${item["id"]?.jsonPrimitive?.content}"
+                name = "الفصل ${item["chapterNumber"]?.jsonPrimitive?.content}"
                 date_upload = System.currentTimeMillis()
             }
-        }.sortedByDescending { it.url.filter { c -> c.isDigit() }.toIntOrNull() ?: 0 }
-    }
-
-    override fun pageListParse(response: Response): List<Page> {
-        val document = Jsoup.parse(response.body.string())
-        return document.select("img[src*=cdn], img.chapter-img").mapIndexed { i, img ->
-            Page(i, imageUrl = img.attr("abs:src"))
         }
     }
 
-    private fun scrambledImageInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val response = chain.proceed(request)
-        if (request.url.fragment != "scrambled") return response
+    // --- Pages (نظام دمج الـ 3 قطع) ---
+    override fun pageListParse(response: Response): List<Page> {
+        val jsonString = response.body.string()
+        val jsonObject = json.decodeFromString<JsonObject>(jsonString)
+        val mediaArray = jsonObject["data"]?.jsonObject?.get("media")?.jsonArray ?: return emptyList()
 
-        val scrambledData = request.url.fragment?.parseAs<ScrambledImage>() ?: return response
-        val input = response.body.byteStream().readBytes()
-        val bitmap = BitmapFactory.decodeByteArray(input, 0, input.size)
+        return mediaArray.mapIndexed { index, element ->
+            val mediaObj = element.jsonObject
+            val parts = mediaObj["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+            // ندمج روابط القطع برمز | ليقوم الـ Interceptor بمعالجتها
+            val combinedUrl = parts.joinToString("|")
+            Page(index, "", "$combinedUrl#unsplit")
+        }
+    }
+
+    // --- Interceptor لدمج الصور المقطعة عمودياً ---
+    private fun imageStitchingInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url.toString()
+
+        if (!url.contains("#unsplit")) return chain.proceed(request)
+
+        val partUrls = url.substringBefore("#unsplit").split("|")
         
-        val result = Bitmap.createBitmap(scrambledData.dim[0], scrambledData.dim[1], Bitmap.Config.ARGB_8888)
+        // تحميل القطع
+        val bitmaps = partUrls.map { partUrl ->
+            val partRequest = request.newBuilder().url(partUrl).build()
+            val response = chain.proceed(partRequest)
+            BitmapFactory.decodeStream(response.body.byteStream())
+        }
+
+        // دمج القطع عمودياً
+        val width = bitmaps[0].width
+        val totalHeight = bitmaps.sumOf { it.height }
+        val result = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
 
-        // فك التشفير بناءً على بيانات Dto.kt
-        scrambledData.pieces.forEachIndexed { index, piece ->
-            val order = scrambledData.order[index]
-            // هنا يتم تجميع الصورة بناءً على الإحداثيات (تبسيط للعملية)
-            // ملاحظة: الكود يفترض وجود منطق التقطيع بناءً على الـ DTO
+        var currentY = 0f
+        bitmaps.forEach { bitmap ->
+            canvas.drawBitmap(bitmap, 0f, currentY, null)
+            currentY += bitmap.height
         }
 
         val output = ByteArrayOutputStream()
-        result.compress(Bitmap.CompressFormat.PNG, 100, output)
+        result.compress(Bitmap.CompressFormat.JPEG, 90, output)
         
-        return response.newBuilder()
-            .body(output.toByteArray().toResponseBody("image/png".toMediaType()))
+        return chain.proceed(request).newBuilder()
+            .body(output.toByteArray().toResponseBody("image/jpeg".toMediaType()))
             .build()
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    override fun getFilterList() = FilterList(SortFilter(), TypeFilter(), StatusFilter(), YearFilter())
-
+    override fun getFilterList() = FilterList()
     private fun getPrefBaseUrl(): String = preferences.getString("overrideBaseUrl", "https://procomic.pro")!!
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val baseUrlPref = androidx.preference.EditTextPreference(screen.context).apply {
-            key = "overrideBaseUrl"
-            title = "Base URL"
-            setDefaultValue("https://procomic.pro")
-        }
-        screen.addPreference(baseUrlPref)
-    }
-    }
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
+}

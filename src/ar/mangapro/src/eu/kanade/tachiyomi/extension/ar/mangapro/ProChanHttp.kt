@@ -11,19 +11,15 @@ object ProChanHttp {
 
     fun getHeaders(baseUrl: String): Headers {
         return Headers.Builder()
-            .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/json,*/*;q=0.8")
-            .add("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+            .add("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.179 Mobile Safari/537.36")
+            .add("Accept", "application/json, text/plain, */*")
+            .add("Accept-Language", "ar-IQ,ar;q=0.9,en-US;q=0.8,en;q=0.7")
             .add("Referer", "$baseUrl/")
-            .add("Cache-Control", "max-age=0")
-            .add("Sec-Ch-Ua", "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"")
-            .add("Sec-Ch-Ua-Mobile", "?0")
-            .add("Sec-Ch-Ua-Platform", "\"Windows\"")
-            .add("Sec-Fetch-Dest", "document")
-            .add("Sec-Fetch-Mode", "navigate")
-            .add("Sec-Fetch-Site", "none")
-            .add("Sec-Fetch-User", "?1")
-            .add("Upgrade-Insecure-Requests", "1")
+            .add("Origin", baseUrl)
+            .add("X-Requested-With", "XMLHttpRequest")
+            .add("Sec-Fetch-Dest", "empty")
+            .add("Sec-Fetch-Mode", "cors")
+            .add("Sec-Fetch-Site", "same-origin")
             .build()
     }
 
@@ -32,19 +28,31 @@ object ProChanHttp {
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .cookieJar(SimpleCookieJar())
-            .addInterceptor(ProChanInterceptor(baseUrl))
+            .addInterceptor { chain ->
+                val originalRequest = chain.request()
+                val url = originalRequest.url.toString()
+                
+                val newRequest = originalRequest.newBuilder()
+                
+                // إذا كان الطلب يتجه للـ API، نضيف ترويسة Next.js الخاصة
+                if (url.contains("/api/")) {
+                    newRequest.addHeader("x-nextjs-data", "1")
+                }
+                
+                chain.proceed(newRequest.build())
+            }
             .build()
     }
 
     class SimpleCookieJar : CookieJar {
-        private val storage = mutableListOf<Cookie>()
+        private val storage = mutableMapOf<String, List<Cookie>>()
 
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-            storage.addAll(cookies)
+            storage[url.host] = cookies
         }
 
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
-            return storage.filter { it.matches(url) }
+            return storage[url.host] ?: listOf()
         }
     }
 }

@@ -38,18 +38,22 @@ class ProChan :
     override val baseUrl by lazy { getPrefBaseUrl() }
     private val preferences by getPreferencesLazy()
     private val apiBaseUrl = "https://procomic.pro/api/public"
-    override val versionId = 6
+    override val versionId = 7
 
+    // استخدام محرك Cloudflare الخاص بالبرنامج لتخطي الحماية
     override val client = network.cloudflareClient.newBuilder()
-        .rateLimit(2) 
+        .rateLimit(1)
         .addInterceptor(::scrambledImageInterceptor)
         .build()
 
+    // رؤوس طلبات (Headers) تحاكي متصفح أندرويد حقيقي تماماً
     override fun headersBuilder() = super.headersBuilder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36")
         .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-        .add("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+        .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
         .add("Referer", "$baseUrl/")
+        .add("sec-ch-ua-mobile", "?1")
+        .add("sec-ch-ua-platform", "\"Android\"")
 
     private val apiHeaders: Headers by lazy {
         headersBuilder()
@@ -66,7 +70,7 @@ class ProChan :
         return GET(url, apiHeaders)
     }
 
-    override fun popularMangaParse(response: Response): MangasPage = latestUpdatesParse(response)
+    override fun popularMangaParse(response: Response) = latestUpdatesParse(response)
 
     override fun latestUpdatesRequest(page: Int): Request {
         val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
@@ -77,7 +81,6 @@ class ProChan :
     }
 
     override fun latestUpdatesParse(response: Response): MangasPage {
-        if (response.code == 403) throw Exception("خطأ 403: يرجى فتح الموقع في WebView لتجاوز الحماية")
         val data = response.parseAs<MetaData<BrowseManga>>()
         val mangas = data.data.map { manga ->
             SManga.create().apply {
@@ -145,7 +148,9 @@ class ProChan :
 
         return try {
             val imageData = scriptData.parseAs<Images>()
-            imageData.images.mapIndexed { i, url -> Page(i, imageUrl = url) }
+            imageData.images.mapIndexed { i, url ->
+                Page(i, imageUrl = url)
+            }
         } catch (e: Exception) { emptyList() }
     }
 

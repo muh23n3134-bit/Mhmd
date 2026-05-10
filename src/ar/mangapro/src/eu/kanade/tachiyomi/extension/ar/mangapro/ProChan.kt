@@ -1,7 +1,6 @@
 package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
@@ -34,7 +33,7 @@ class ProChan :
     override val supportsLatest = true
     override val baseUrl by lazy { getPrefBaseUrl() }
     private val preferences by getPreferencesLazy()
-    override val versionId = 9
+    override val versionId = 12
 
     override val client = network.cloudflareClient.newBuilder()
         .rateLimit(1)
@@ -49,24 +48,50 @@ class ProChan :
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = Jsoup.parse(response.body.string())
-        val mangas = document.select("a[href*=/series/]").map { element ->
+        val mangas = document.select("a[href*=/series/]").mapNotNull { element ->
+            val titleText = element.select("h3, h2").text().trim()
+            if (titleText.isEmpty()) return@mapNotNull null
             SManga.create().apply {
                 url = element.attr("href").removePrefix(baseUrl)
-                title = element.select("h3").text().trim()
+                title = titleText
                 thumbnail_url = element.select("img").attr("abs:src")
             }
-        }.filter { it.url.isNotBlank() }
-        return MangasPage(mangas, mangas.isNotEmpty())
+        }.distinctBy { it.url }
+
+        val hasNextPage = mangas.size >= 15
+        return MangasPage(mangas, hasNextPage)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
-    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/updates?page=$page", headers)
+
+    override fun latestUpdatesParse(response: Response): MangasPage {
+        val document = Jsoup.parse(response.body.string())
+        val mangas = document.select("div.grid > div").mapNotNull { element ->
+            val linkElement = element.selectFirst("a[href*=/series/]") ?: return@mapNotNull null
+            SManga.create().apply {
+                url = linkElement.attr("href").removePrefix(baseUrl)
+                title = element.select("h3, h2, .font-bold").first()?.text()?.trim() ?: ""
+                thumbnail_url = element.select("img").attr("abs:src")
+            }
+        }.distinctBy { it.url }
+
+        val hasNextPage = mangas.size >= 15
+        return MangasPage(mangas, hasNextPage)
+    }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/series".toHttpUrl().newBuilder()
-            .addQueryParameter("search", query)
-            .addQueryParameter("page", page.toString())
-            .build()
+        val url = "$baseUrl/series".toHttpUrl().newBuilder().apply {
+            addQueryParameter("page", page.toString())
+            if (query.isNotBlank()) addQueryParameter("search", query)
+            filters.forEach { filter ->
+                when (filter) {
+                    is SortFilter -> addQueryParameter("sort", filter.selected)
+                    is TypeFilter -> filter.selected?.let { addQueryParameter("type", it) }
+                    is StatusFilter -> filter.selected?.let { addQueryParameter("status", it) }
+                    is YearFilter -> filter.selected?.let { addQueryParameter("year", it) }
+                }
+            }
+        }.build()
         return GET(url, headers)
     }
 
@@ -76,8 +101,15 @@ class ProChan :
         val document = Jsoup.parse(response.body.string())
         return SManga.create().apply {
             title = document.select("h1").text().trim()
-            description = document.select("p").firstOrNull()?.text()
-            thumbnail_url = document.select("img").firstOrNull()?.attr("abs:src")
+            description = document.select("p.text-sm.line-clamp-6, div.description").text().trim()
+            thumbnail_url = document.select("img[alt=poster]").attr("abs:src")
+            author = document.select("div:contains(المؤلف) + div").text().trim()
+            genre = document.select("div.flex.wrap a[href*=genres]").joinToString { it.text() }
+            status = when {
+                document.text().contains("مستمر") -> SManga.ONGOING
+                document.text().contains("مكتمل") -> SManga.COMPLETED
+                else -> SManga.UNKNOWN
+            }
             initialized = true
         }
     }
@@ -87,7 +119,7 @@ class ProChan :
         return document.select("a[href*=/chapter/]").map { element ->
             SChapter.create().apply {
                 url = element.attr("href").removePrefix(baseUrl)
-                name = "الفصل " + element.text().filter { it.isDigit() }
+                name = element.text().trim()
                 date_upload = System.currentTimeMillis()
             }
         }
@@ -115,6 +147,13 @@ class ProChan :
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
+    override fun getFilterList() = FilterList(
+        SortFilter(),
+        TypeFilter(),
+        StatusFilter(),
+        YearFilter(),
+    )
+
     private fun getPrefBaseUrl(): String = preferences.getString("overrideBaseUrl", "https://procomic.pro")!!
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
@@ -125,4 +164,4 @@ class ProChan :
         }
         screen.addPreference(baseUrlPref)
     }
-    }
+}

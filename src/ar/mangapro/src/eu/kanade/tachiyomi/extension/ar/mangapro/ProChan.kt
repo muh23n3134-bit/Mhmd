@@ -48,36 +48,30 @@ class ProChan : HttpSource(), ConfigurableSource {
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .add("Referer", "$baseUrl/")
 
-    override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/api/public/content/latest-updates?limit=18&category=comics&page=$page", headers)
-    }
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/series?page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val jsonString = response.body.string()
-        val jsonObject = json.decodeFromString<JsonObject>(jsonString)
-        val data = jsonObject["data"]?.jsonArray ?: return MangasPage(emptyList(), false)
-
-        val mangas = data.map { element ->
-            val item = element.jsonObject
+        val document = Jsoup.parse(response.body.string())
+        val mangas = document.select("a[href*=/series/]").mapNotNull { element ->
+            val url = element.attr("href")
+            val title = element.select("h3, h2, p").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
+            val thumb = element.select("img").attr("abs:src")
+            if (title == null || !url.contains("/series/")) return@mapNotNull null
             SManga.create().apply {
-                val type = item["type"]?.jsonPrimitive?.content ?: "manhua"
-                val id = item["id"]?.jsonPrimitive?.content ?: ""
-                val slug = item["slug"]?.jsonPrimitive?.content ?: ""
-                url = "/series/$type/$id/$slug"
-                title = item["title"]?.jsonPrimitive?.content ?: ""
-                thumbnail_url = item["poster"]?.jsonPrimitive?.content
+                this.url = url.substringAfter(baseUrl)
+                this.title = title
+                this.thumbnail_url = thumb
             }
-        }
-        return MangasPage(mangas, data.size >= 18)
+        }.distinctBy { it.url }
+        return MangasPage(mangas, mangas.size >= 12)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/updates?page=$page", headers)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return GET("$baseUrl/api/public/content/search?search=$query&page=$page&limit=18", headers)
+        return GET("$baseUrl/series?search=$query&page=$page", headers)
     }
-
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     override fun mangaDetailsParse(response: Response): SManga {
@@ -86,7 +80,6 @@ class ProChan : HttpSource(), ConfigurableSource {
             title = document.select("h1").text().trim()
             description = document.select("p.text-sm.line-clamp-6").text().trim()
             thumbnail_url = document.select("img[alt=poster]").firstOrNull()?.attr("abs:src") ?: ""
-            author = document.select("div:contains(المؤلف) + div").text().trim()
             genre = document.select("div.flex.wrap a").joinToString { it.text() }
             status = if (document.text().contains("مستمر")) SManga.ONGOING else SManga.COMPLETED
             initialized = true
@@ -95,15 +88,14 @@ class ProChan : HttpSource(), ConfigurableSource {
 
     override fun chapterListRequest(manga: SManga): Request {
         val segments = manga.url.trim('/').split("/")
-        val mangaId = if (segments.size >= 3) segments[2] else ""
-        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?page=1&limit=500&order=desc", headers)
+        val mangaId = segments.getOrNull(2) ?: ""
+        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?limit=500&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val jsonString = response.body.string()
         val jsonObject = json.decodeFromString<JsonObject>(jsonString)
         val chaptersData = jsonObject["data"]?.jsonArray ?: return emptyList()
-
         return chaptersData.map { element ->
             val item = element.jsonObject
             SChapter.create().apply {
@@ -123,59 +115,32 @@ class ProChan : HttpSource(), ConfigurableSource {
         val jsonString = response.body.string()
         val jsonObject = json.decodeFromString<JsonObject>(jsonString)
         val mediaArray = jsonObject["data"]?.jsonObject?.get("media")?.jsonArray ?: return emptyList()
-
         return mediaArray.mapIndexed { index, element ->
             val parts = element.jsonObject["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            val combinedUrl = parts.joinToString("|")
-            Page(index, "", "$combinedUrl#unsplit")
+            Page(index, "", parts.joinToString("|") + "#unsplit")
         }
     }
 
     private fun imageStitchingInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val url = request.url.toString()
-
         if (!url.contains("#unsplit")) return chain.proceed(request)
-
         val partUrls = url.substringBefore("#unsplit").split("|")
-
-        val bitmaps = partUrls.map { partUrl ->
-            val partRequest = request.newBuilder().url(partUrl).build()
-            val response = chain.proceed(partRequest)
-            BitmapFactory.decodeStream(response.body.byteStream())
+        val bitmaps = partUrls.map {
+            val res = chain.proceed(request.newBuilder().url(it).build())
+            BitmapFactory.decodeStream(res.body.byteStream())
         }
-
-        val width = bitmaps[0].width
-        val totalHeight = bitmaps.sumOf { it.height }
-        val result = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
+        val result = Bitmap.createBitmap(bitmaps[0].width, bitmaps.sumOf { it.height }, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
-
-        var currentY = 0f
-        bitmaps.forEach { bitmap ->
-            canvas.drawBitmap(bitmap, 0f, currentY, null)
-            currentY += bitmap.height
-        }
-
-        val output = ByteArrayOutputStream()
-        result.compress(Bitmap.CompressFormat.JPEG, 90, output)
-
-        return chain.proceed(request).newBuilder()
-            .body(output.toByteArray().toResponseBody("image/jpeg".toMediaType()))
-            .build()
+        var y = 0f
+        bitmaps.forEach { canvas.drawBitmap(it, 0f, y, null); y += it.height }
+        val out = ByteArrayOutputStream()
+        result.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        return chain.proceed(request).newBuilder().body(out.toByteArray().toResponseBody("image/jpeg".toMediaType())).build()
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
     override fun getFilterList() = FilterList()
-
     private fun getPrefBaseUrl(): String = preferences.getString("overrideBaseUrl", "https://procomic.pro")!!
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val baseUrlPref = androidx.preference.EditTextPreference(screen.context).apply {
-            key = "overrideBaseUrl"
-            title = "Base URL"
-            setDefaultValue("https://procomic.pro")
-        }
-        screen.addPreference(baseUrlPref)
-    }
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
 }

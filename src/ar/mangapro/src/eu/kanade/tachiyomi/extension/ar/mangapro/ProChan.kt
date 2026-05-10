@@ -27,6 +27,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonClassDiscriminator
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -81,8 +82,6 @@ class ProChan : HttpSource() {
         .set("rsc", "1")
         .build()
 
-    // ============================== القوائم والبحث ==============================
-
     override fun fetchPopularManga(page: Int): Observable<MangasPage> {
         val filters = getFilterList().apply {
             firstInstance<SortFilter>().state = 2
@@ -106,17 +105,6 @@ class ProChan : HttpSource() {
     }
 
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            val path = url.pathSegments
-            if (url.host == domain && path.size >= 4 && path[0] == "series") {
-                val manga = SManga.create().apply {
-                    this.url = "/series/${path[1]}/${path[2]}/${path[3]}"
-                }
-                return fetchMangaDetails(manga).map { MangasPage(listOf(it), false) }
-            }
-        }
-
         val key = searchKey(query, filters)
         if (page == 1) pageNumber[key] = 1
 
@@ -163,12 +151,11 @@ class ProChan : HttpSource() {
         return GET(url, headers)
     }
 
-    // ============================== تفاصيل العمل ==============================
-
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val manga = response.extractNextJs<Series>()!!.series
+        val nextJsData = response.extractNextJs<Series>() ?: throw IOException("Failed to parse details")
+        val manga = nextJsData.series
         return SManga.create().apply {
             url = "/series/${manga.type}/${manga.id}/${manga.slug}"
             title = manga.title
@@ -188,47 +175,36 @@ class ProChan : HttpSource() {
         }
     }
 
-    // ============================== الفصول ==============================
-
     override fun chapterListRequest(manga: SManga) = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val data = response.extractNextJs<InitialChapters>()!!
+        val data = response.extractNextJs<InitialChapters>() ?: return emptyList()
         val chapters = data.initialChapters.toMutableList()
         val type = response.request.url.pathSegments[1]
         val id = response.request.url.pathSegments[2]
         val slug = response.request.url.pathSegments[3]
 
-        [span_0](start_span)// جلب الفصول الإضافية إذا وجدت[span_0](end_span)
-        var page = 2
-        while (data.totalChapters > chapters.size) {
-            val next = client.newCall(GET("$baseUrl/api/public/$type/$id/chapters?page=${page++}&limit=50&order=desc", headers)).execute()
-            if (!next.isSuccessful) break
-            chapters.addAll(next.parseAs<Data<List<Chapter>>>().data)
+        if (data.totalChapters > chapters.size) {
+            val next = client.newCall(GET("$baseUrl/api/public/$type/$id/chapters?page=2&limit=100&order=desc", headers)).execute()
+            if (next.isSuccessful) {
+                chapters.addAll(next.parseAs<Data<List<Chapter>>>().data)
+            }
         }
-
-        countViews(id)
 
         return chapters.filter { it.language == "AR" }.map { chapter ->
             SChapter.create().apply {
                 url = "/series/$type/$id/$slug/${chapter.id}/${chapter.number}"
                 name = "الفصل ${chapter.number}" + (chapter.title?.let { " - $it" } ?: "")
-                chapter_number = chapter.number.toFloat()
+                chapter_number = chapter.number.toFloatOrNull() ?: -1f
                 date_upload = dateFormat.tryParse(chapter.createdAt)
             }
         }.sortedByDescending { it.chapter_number }
     }
 
-    // ============================== الصفحات وفك التشفير ==============================
-
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
-        val responseBody = response.body.string()
-        val imageData = responseBody.extractNextJsRsc<Images>() ?: return emptyList()
-
-        val seriesId = response.request.url.pathSegments[2]
-        val chapterId = response.request.url.pathSegments[4]
+        val imageData = response.extractNextJsRsc<Images>() ?: return emptyList()
         val chapterUrl = response.request.url.toString()
         
         val pages = mutableListOf<Page>()
@@ -236,8 +212,6 @@ class ProChan : HttpSource() {
         imageData.maps.forEachIndexed { i, map ->
             pages.add(Page(pages.size + i, chapterUrl, "http://$SCRAMBLED_IMAGE_HOST/#${map.toJsonString()}"))
         }
-
-        countViews(seriesId, chapterId)
         return pages
     }
 
@@ -245,19 +219,15 @@ class ProChan : HttpSource() {
         val request = chain.request()
         if (request.url.host != SCRAMBLED_IMAGE_HOST) return chain.proceed(request)
 
-        val chapterUrl = request.header("Referer")!!
-        val cdn = when (chapterUrl.toHttpUrl().pathSegments[1]) {
-            "manga" -> "cdn1"
-            "manhua" -> "cdn2"
-            else -> "cdn3"
-        }
+        val chapterUrl = request.header("Referer") ?: baseUrl
+        val cdn = if (chapterUrl.contains("/manhua/")) "cdn2" else "cdn1"
 
         val scrambledImage = when (val data = request.url.fragment!!.parseAs<ScrambledData>()) {
             is ScrambledImage -> data
             is ScrambledImageToken -> decodeScrambledImageToken(data)
         }
 
-        val (puzzleMode, layout) = scrambledImage.mode.split("_", limit = 2)
+        val layout = scrambledImage.mode.substringAfter("_")
         val orderedPieces = scrambledImage.order.map { scrambledImage.pieces[it] }
 
         val pieceBitmaps = runBlocking {
@@ -268,7 +238,7 @@ class ProChan : HttpSource() {
                     val decoder = ImageDecoder.newInstance(res.body.byteStream())
                     val bmp = decoder?.decode()
                     decoder?.recycle()
-                    bmp ?: throw Exception("Failed to decode")
+                    bmp!!
                 }
             }.awaitAll()
         }
@@ -276,7 +246,7 @@ class ProChan : HttpSource() {
         val resultBitmap = Bitmap.createBitmap(scrambledImage.dim[0], scrambledImage.dim[1], Bitmap.Config.ARGB_8888)
         val canvas = Canvas(resultBitmap)
 
-        if (puzzleMode == "grid") {
+        if (scrambledImage.mode.startsWith("grid")) {
             val cols = layout.split('x')[0].toInt()
             pieceBitmaps.forEachIndexed { i, bmp ->
                 canvas.drawBitmap(bmp, (i % cols * bmp.width).toFloat(), (i / cols * bmp.height).toFloat(), null)
@@ -307,14 +277,6 @@ class ProChan : HttpSource() {
 
     private fun urlSafeBase64(data: String) = Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL).decode(data)
 
-    private fun countViews(seriesId: String, chapterId: String? = null) {
-        val payload = ViewsDto(chapterId?.toInt(), seriesId.toInt(), "mobile", if (chapterId == null) "series" else "chapter").toJsonString().toRequestBody(JSON_MEDIA_TYPE)
-        client.newCall(POST("$baseUrl/api/views", headers, payload)).enqueue(object : Callback {
-            override fun onResponse(call: Call, response: Response) = response.closeQuietly()
-            override fun onFailure(call: Call, e: IOException) {}
-        })
-    }
-
     override fun getFilterList() = FilterList(TypeFilter(), SortFilter(), YearFilter(), StatusFilter())
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT)
     override fun popularMangaParse(response: Response) = throw UnsupportedOperationException()
@@ -324,8 +286,6 @@ class ProChan : HttpSource() {
     override fun searchMangaParse(response: Response) = throw UnsupportedOperationException()
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }
-
-// ============================== النماذج والفلاتر المكملة ==============================
 
 @Serializable data class Data<T>(val data: T)
 @Serializable data class MetaData<T>(val data: List<T>, val meta: PageMeta)
@@ -342,13 +302,11 @@ class ProChan : HttpSource() {
 @Serializable @SerialName("image") data class ScrambledImage(val dim: List<Int>, val pieces: List<String>, val order: List<Int>, val mode: String) : ScrambledData
 @Serializable @SerialName("token") data class ScrambledImageToken(val token: String) : ScrambledData
 @Serializable data class ScrambledImageTokenValue(val iv: String, val tag: String, val data: String, val cid: Int)
-@Serializable data class ViewsDto(val chapterId: Int?, val contentId: Int, val deviceType: String, val surface: String)
 
 private val SUPPORTED_TYPES = setOf("manga", "manhwa", "manhua")
 private const val SCRAMBLED_IMAGE_HOST = "127.0.0.1"
-private val JSON_MEDIA_TYPE = "application/json".toMediaType()
 
-class TypeFilter : SelectFilter("النوع", arrayOf("الكل", "مانجا", "مانهوا", "مانهوا"), arrayOf(null, "manga", "manhwa", "manhua"))
+class TypeFilter : SelectFilter("النوع", arrayOf("الكل", "مانجا", "مانهوا", "مانها"), arrayOf(null, "manga", "manhwa", "manhua"))
 class SortFilter : SelectFilter("الترتيب", arrayOf("الأحدث", "المشاهدات"), arrayOf("latest", "views"))
 class YearFilter : SelectFilter("السنة", (listOf("الكل") + (2024 downTo 2010).map { it.toString() }).toTypedArray())
 class StatusFilter : SelectFilter("الحالة", arrayOf("الكل", "مستمر", "مكتمل"), arrayOf(null, "مستمر", "مكتمل"))

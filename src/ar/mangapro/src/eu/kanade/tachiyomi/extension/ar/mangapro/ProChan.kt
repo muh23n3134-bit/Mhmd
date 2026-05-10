@@ -68,7 +68,12 @@ class ProChan : HttpSource() {
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
                 .header("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
                 .header("DNT", "1")
+                .header("Connection", "keep-alive")
                 .header("Upgrade-Insecure-Requests", "1")
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "none")
+                .header("Cache-Control", "max-age=0")
                 .build()
             chain.proceed(request)
         }
@@ -164,9 +169,12 @@ class ProChan : HttpSource() {
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga {
+        // FIX: Call response.body.string() FIRST to get the HTML as a String
         val bodyString = response.body.string()
+        // Then pass the String to extractNextJs utility
         val nextJsData = bodyString.extractNextJs<Series>() ?: throw IOException("Failed to parse details")
         val manga = nextJsData.series
+        
         return SManga.create().apply {
             url = "/series/${manga.type}/${manga.id}/${manga.slug}"
             title = manga.title
@@ -189,7 +197,9 @@ class ProChan : HttpSource() {
     override fun chapterListRequest(manga: SManga) = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
+        // FIX: Call response.body.string() FIRST to get the HTML as a String
         val bodyString = response.body.string()
+        // Then pass the String to extractNextJs utility
         val data = bodyString.extractNextJs<InitialChapters>() ?: return emptyList()
         val chapters = data.initialChapters.toMutableList()
         val urlSegments = response.request.url.pathSegments
@@ -200,7 +210,8 @@ class ProChan : HttpSource() {
         if (data.totalChapters > chapters.size) {
             val next = client.newCall(GET("$baseUrl/api/public/$type/$id/chapters?page=2&limit=100&order=desc", headers)).execute()
             if (next.isSuccessful) {
-                chapters.addAll(next.parseAs<Data<List<Chapter>>>().data)
+                val nextBodyString = next.body.string()
+                chapters.addAll(nextBodyString.parseAs<Data<List<Chapter>>>().data)
             }
         }
 
@@ -217,7 +228,9 @@ class ProChan : HttpSource() {
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
+        // FIX: Call response.body.string() FIRST to get the HTML/RSC content as a String
         val bodyString = response.body.string()
+        // Then pass the String to extractNextJsRsc utility (NOT the Response object)
         val imageData = bodyString.extractNextJsRsc<Images>() ?: return emptyList()
         val chapterUrl = response.request.url.toString()
         
@@ -302,27 +315,121 @@ class ProChan : HttpSource() {
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }
 
-@Serializable data class Data<T>(val data: T)
-@Serializable data class MetaData<T>(val data: List<T>, val meta: PageMeta)
-@Serializable data class PageMeta(val currentPage: Int? = null, val totalPages: Int? = null) { fun hasNextPage() = (currentPage ?: 0) < (totalPages ?: 0) }
-@Serializable data class BrowseManga(val id: Int, val title: String, val slug: String, val type: String, val progress: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val cdn: String? = null)
-@Serializable data class CoverImageApp(val desktop: String? = null)
-@Serializable data class Series(val series: MangaDetail)
-@Serializable data class MangaDetail(val id: Int, val title: String, val slug: String, val type: String, val description: String? = null, val progress: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val cdn: String? = null, val metadata: MangaMetadata)
-@Serializable data class MangaMetadata(val artist: List<String> = emptyList(), val author: List<String> = emptyList(), val genres: List<String> = emptyList(), val coverImage: String? = null)
-@Serializable data class InitialChapters(val initialChapters: List<Chapter>, val totalChapters: Int)
-@Serializable data class Chapter(val id: Int, val number: String, val title: String? = null, val language: String? = "AR", val createdAt: String)
-@Serializable data class Images(val images: List<String> = emptyList(), val maps: List<ScrambledData> = emptyList())
-@Serializable @JsonClassDiscriminator("type") sealed interface ScrambledData
-@Serializable @SerialName("image") data class ScrambledImage(val dim: List<Int>, val pieces: List<String>, val order: List<Int>, val mode: String) : ScrambledData
-@Serializable @SerialName("token") data class ScrambledImageToken(val token: String) : ScrambledData
-@Serializable data class ScrambledImageTokenValue(val iv: String, val tag: String, val data: String, val cid: Int)
+// ============ DATA CLASSES / DTOs ============
+// All DTOs included in this file to avoid redeclaration errors
 
+@Serializable
+data class Data<T>(val data: T)
+
+@Serializable
+data class MetaData<T>(val data: List<T>, val meta: PageMeta)
+
+@Serializable
+data class PageMeta(val currentPage: Int? = null, val totalPages: Int? = null) {
+    fun hasNextPage() = (currentPage ?: 0) < (totalPages ?: 0)
+}
+
+@Serializable
+data class BrowseManga(
+    val id: Int,
+    val title: String,
+    val slug: String,
+    val type: String,
+    val progress: String? = null,
+    val coverImage: String? = null,
+    val coverImageApp: CoverImageApp? = null,
+    val cdn: String? = null,
+)
+
+@Serializable
+data class CoverImageApp(val desktop: String? = null)
+
+@Serializable
+data class Series(val series: MangaDetail)
+
+@Serializable
+data class MangaDetail(
+    val id: Int,
+    val title: String,
+    val slug: String,
+    val type: String,
+    val description: String? = null,
+    val progress: String? = null,
+    val coverImage: String? = null,
+    val coverImageApp: CoverImageApp? = null,
+    val cdn: String? = null,
+    val metadata: MangaMetadata,
+)
+
+@Serializable
+data class MangaMetadata(
+    val artist: List<String> = emptyList(),
+    val author: List<String> = emptyList(),
+    val genres: List<String> = emptyList(),
+    val coverImage: String? = null,
+)
+
+@Serializable
+data class InitialChapters(val initialChapters: List<Chapter>, val totalChapters: Int)
+
+@Serializable
+data class Chapter(
+    val id: Int,
+    val number: String,
+    val title: String? = null,
+    val language: String? = "AR",
+    val createdAt: String,
+)
+
+@Serializable
+data class Images(
+    val images: List<String> = emptyList(),
+    val maps: List<ScrambledData> = emptyList(),
+)
+
+@Serializable
+@JsonClassDiscriminator("type")
+sealed interface ScrambledData
+
+@Serializable
+@SerialName("image")
+data class ScrambledImage(
+    val dim: List<Int>,
+    val pieces: List<String>,
+    val order: List<Int>,
+    val mode: String,
+) : ScrambledData
+
+@Serializable
+@SerialName("token")
+data class ScrambledImageToken(val token: String) : ScrambledData
+
+@Serializable
+data class ScrambledImageTokenValue(
+    val iv: String,
+    val tag: String,
+    val data: String,
+    val cid: Int,
+)
+
+// ============ CONSTANTS ============
 private val SUPPORTED_TYPES = setOf("manga", "manhwa", "manhua")
 private const val SCRAMBLED_IMAGE_HOST = "127.0.0.1"
 
+// ============ FILTER CLASSES ============
 class TypeFilter : SelectFilter("النوع", arrayOf("الكل", "مانجا", "مانهوا", "مانها"), arrayOf(null, "manga", "manhwa", "manhua"))
+
 class SortFilter : SelectFilter("الترتيب", arrayOf("الأحدث", "المشاهدات"), arrayOf("latest", "views"))
-class YearFilter : SelectFilter("السنة", (listOf("الكل") + (2024 downTo 2010).map { it.toString() }).toTypedArray())
+
+class YearFilter : SelectFilter("ا��سنة", (listOf("الكل") + (2024 downTo 2010).map { it.toString() }).toTypedArray())
+
 class StatusFilter : SelectFilter("الحالة", arrayOf("الكل", "مستمر", "مكتمل"), arrayOf(null, "مستمر", "مكتمل"))
-open class SelectFilter(n: String, val v: Array<String>, val k: Array<String?> = emptyArray()) : Filter.Select<String>(n, v) { val selected get() = if (k.isNotEmpty()) k[state] else v[state].takeIf { it != "الكل" } }
+
+open class SelectFilter(
+    n: String,
+    val v: Array<String>,
+    val k: Array<String?> = emptyArray(),
+) : Filter.Select<String>(n, v) {
+    val selected
+        get() = if (k.isNotEmpty()) k[state] else v[state].takeIf { it != v[0] }
+}

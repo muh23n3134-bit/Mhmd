@@ -35,7 +35,6 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
 import okhttp3.internal.closeQuietly
@@ -204,13 +203,15 @@ class ProChan : HttpSource() {
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
-        val imageData = response.extractNextJsRsc<Images>() ?: return emptyList()
+        val bodyString = response.body.string()
+        val imageData = bodyString.extractNextJsRsc<Images>() ?: return emptyList()
         val chapterUrl = response.request.url.toString()
         
         val pages = mutableListOf<Page>()
         imageData.images.forEachIndexed { i, url -> pages.add(Page(i, chapterUrl, url)) }
-        imageData.maps.forEachIndexed { i, map ->
-            pages.add(Page(pages.size + i, chapterUrl, "http://$SCRAMBLED_IMAGE_HOST/#${map.toJsonString()}"))
+        imageData.maps.forEach { map ->
+            val mapJson = map.toJsonString<ScrambledData>()
+            pages.add(Page(pages.size, chapterUrl, "http://$SCRAMBLED_IMAGE_HOST/#$mapJson"))
         }
         return pages
     }

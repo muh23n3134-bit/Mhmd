@@ -48,19 +48,21 @@ class ProChan : HttpSource(), ConfigurableSource {
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .add("Referer", "$baseUrl/")
 
+    // --- القائمة الرئيسية (استخدام Jsoup لضمان الظهور) ---
     override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/series?page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = Jsoup.parse(response.body.string())
         val mangas = document.select("a[href*=/series/]").mapNotNull { element ->
             val url = element.attr("href")
-            val title = element.select("h3, h2, p").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
-            val thumb = element.select("img").attr("abs:src")
-            if (title == null || !url.contains("/series/")) return@mapNotNull null
+            // التأكد من أن الرابط يحتوي على رقم ID (مثلاً /series/manhua/34/...)
+            if (!url.contains(Regex("""/series/\w+/\d+/"""))) return@mapNotNull null
+            
+            val titleText = element.select("h3, h2, p, span").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
             SManga.create().apply {
                 this.url = url.substringAfter(baseUrl)
-                this.title = title
-                this.thumbnail_url = thumb
+                this.title = titleText ?: "بدون عنوان"
+                this.thumbnail_url = element.select("img").attr("abs:src")
             }
         }.distinctBy { it.url }
         return MangasPage(mangas, mangas.size >= 12)
@@ -74,38 +76,44 @@ class ProChan : HttpSource(), ConfigurableSource {
     }
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
+    // --- تفاصيل المانجا ---
     override fun mangaDetailsParse(response: Response): SManga {
         val document = Jsoup.parse(response.body.string())
         return SManga.create().apply {
             title = document.select("h1").text().trim()
-            description = document.select("p.text-sm.line-clamp-6").text().trim()
-            thumbnail_url = document.select("img[alt=poster]").firstOrNull()?.attr("abs:src") ?: ""
-            genre = document.select("div.flex.wrap a").joinToString { it.text() }
+            description = document.select("p.text-sm.line-clamp-6, div.description").text().trim()
+            thumbnail_url = document.select("img[alt=poster], img.object-cover").firstOrNull()?.attr("abs:src") ?: ""
+            genre = document.select("div.flex.wrap a[href*=genres]").joinToString { it.text() }
             status = if (document.text().contains("مستمر")) SManga.ONGOING else SManga.COMPLETED
             initialized = true
         }
     }
 
+    // --- الفصول (حل مشكلة الـ 404 وتداخل العناوين) ---
     override fun chapterListRequest(manga: SManga): Request {
-        val segments = manga.url.trim('/').split("/")
-        val mangaId = segments.getOrNull(2) ?: ""
-        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?limit=500&order=desc", headers)
+        // استخراج الـ ID بدقة من الرابط /series/type/ID/slug
+        val id = manga.url.split("/").filter { it.isNotBlank() }.getOrNull(2) ?: ""
+        return GET("$baseUrl/api/public/manhua/$id/chapters?limit=500&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val jsonString = response.body.string()
         val jsonObject = json.decodeFromString<JsonObject>(jsonString)
         val chaptersData = jsonObject["data"]?.jsonArray ?: return emptyList()
+        
         return chaptersData.map { element ->
             val item = element.jsonObject
+            val chapterId = item["id"]?.jsonPrimitive?.content ?: ""
             SChapter.create().apply {
-                url = "/chapter/${item["id"]?.jsonPrimitive?.content}"
-                name = "الفصل " + (item["chapterNumber"]?.jsonPrimitive?.content ?: "")
+                // نضع بادئة /api_chapter/ لنميز رابط الفصل عن رابط المانجا
+                url = "/api_chapter/$chapterId"
+                name = "الفصل " + (item["chapterNumber"]?.jsonPrimitive?.content ?: "0")
                 date_upload = System.currentTimeMillis()
             }
         }
     }
 
+    // --- الصفحات (نظام الدمج) ---
     override fun pageListRequest(chapter: SChapter): Request {
         val chapterId = chapter.url.substringAfterLast("/")
         return GET("$baseUrl/api/public/chapters/$chapterId/images", headers)
@@ -114,29 +122,41 @@ class ProChan : HttpSource(), ConfigurableSource {
     override fun pageListParse(response: Response): List<Page> {
         val jsonString = response.body.string()
         val jsonObject = json.decodeFromString<JsonObject>(jsonString)
-        val mediaArray = jsonObject["data"]?.jsonObject?.get("media")?.jsonArray ?: return emptyList()
+        val data = jsonObject["data"]?.jsonObject ?: return emptyList()
+        val mediaArray = data["media"]?.jsonArray ?: return emptyList()
+        
         return mediaArray.mapIndexed { index, element ->
             val parts = element.jsonObject["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
             Page(index, "", parts.joinToString("|") + "#unsplit")
         }
     }
 
+    // --- معالج الصور (Interceptor) ---
     private fun imageStitchingInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val url = request.url.toString()
         if (!url.contains("#unsplit")) return chain.proceed(request)
+        
         val partUrls = url.substringBefore("#unsplit").split("|")
-        val bitmaps = partUrls.map {
+        val bitmaps = partUrls.mapNotNull {
             val res = chain.proceed(request.newBuilder().url(it).build())
-            BitmapFactory.decodeStream(res.body.byteStream())
+            if (res.isSuccessful) BitmapFactory.decodeStream(res.body.byteStream()) else null
         }
-        val result = Bitmap.createBitmap(bitmaps[0].width, bitmaps.sumOf { it.height }, Bitmap.Config.ARGB_8888)
+        
+        if (bitmaps.isEmpty()) return chain.proceed(request)
+        
+        val width = bitmaps[0].width
+        val totalHeight = bitmaps.sumOf { it.height }
+        val result = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
         var y = 0f
         bitmaps.forEach { canvas.drawBitmap(it, 0f, y, null); y += it.height }
+        
         val out = ByteArrayOutputStream()
         result.compress(Bitmap.CompressFormat.JPEG, 85, out)
-        return chain.proceed(request).newBuilder().body(out.toByteArray().toResponseBody("image/jpeg".toMediaType())).build()
+        return chain.proceed(request).newBuilder()
+            .body(out.toByteArray().toResponseBody("image/jpeg".toMediaType()))
+            .build()
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()

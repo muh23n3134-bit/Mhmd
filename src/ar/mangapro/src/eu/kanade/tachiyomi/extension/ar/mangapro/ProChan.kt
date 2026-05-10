@@ -31,20 +31,23 @@ class ProChan : HttpSource() {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val mangas = document.select("div.grid div.relative.group, a[href^='/series/']").mapNotNull { element: Element ->
-            val link = if (element.tagName() == "a") element else element.select("a").first()
-            val titleText = element.select("h3, div.text-sm").text().trim()
+        
+        val mangas = document.select("div.grid > div, a[href^='/series/']").mapNotNull { element: Element ->
+            val link = if (element.tagName() == "a") element else element.select("a[href^='/series/']").first()
+            val titleText = element.select("h3, div.text-sm, span.font-bold").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
             val img = element.select("img").attr("abs:src")
 
-            if (link != null && titleText.isNotEmpty()) {
+            if (link != null && !titleText.isNullOrEmpty()) {
                 SManga.create().apply {
                     url = link.attr("href")
                     title = titleText
                     thumbnail_url = img
                 }
             } else null
-        }
+        }.distinctBy { it.url }
+
         val hasNextPage = document.select("button:contains(التالي), a[href*='page=']").isNotEmpty()
+        
         return MangasPage(mangas, hasNextPage)
     }
 
@@ -70,7 +73,11 @@ class ProChan : HttpSource() {
         return ProChanParser.chapterListParse(response.asJsoup())
     }
 
-    override fun pageListParse(response: Response) = throw UnsupportedOperationException()
+    override fun pageListParse(response: Response): List<eu.kanade.tachiyomi.source.model.Page> {
+        throw UnsupportedOperationException("قيد التطوير")
+    }
 
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response): String {
+        throw UnsupportedOperationException("قيد التطوير")
+    }
 }

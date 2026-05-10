@@ -1,200 +1,355 @@
 package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.graphics.Rect
-import androidx.preference.PreferenceScreen
+import android.util.Log
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
-import eu.kanade.tachiyomi.source.ConfigurableSource
+import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.network.asObservableSuccess
+import eu.kanade.tachiyomi.network.await
+import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
-import keiyoushi.utils.getPreferencesLazy
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import okhttp3.Headers
+import keiyoushi.lib.cookieinterceptor.CookieInterceptor
+import keiyoushi.utils.extractNextJs
+import keiyoushi.utils.extractNextJsRsc
+import keiyoushi.utils.firstInstance
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonString
+import keiyoushi.utils.tryParse
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Protocol
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
-import uy.kohesive.injekt.injectLazy
-import java.io.ByteArrayOutputStream
+import okhttp3.ResponseBody.Companion.asResponseBody
+import okhttp3.internal.closeQuietly
+import okio.Buffer
+import rx.Observable
+import tachiyomi.decoder.ImageDecoder
+import java.io.IOException
+import java.lang.UnsupportedOperationException
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.io.encoding.Base64
 
-class ProChan : HttpSource(), ConfigurableSource {
-
+class ProChan : HttpSource() {
     override val name = "ProChan"
     override val lang = "ar"
+    private val domain = "procomic.pro"
+    override val baseUrl = "https://$domain"
     override val supportsLatest = true
-    override val baseUrl by lazy { getPrefBaseUrl() }
-    private val preferences by getPreferencesLazy()
-    private val json: Json by injectLazy()
+    override val versionId = 5
 
     override val client = network.cloudflareClient.newBuilder()
-        .rateLimit(2)
-        .addInterceptor(::imageReconstructorInterceptor)
+        .addInterceptor(::scrambledImageInterceptor)
+        .addNetworkInterceptor(
+            CookieInterceptor(
+                domain,
+                listOf(
+                    "safe_browsing" to "off",
+                    "language" to "ar",
+                ),
+            ),
+        )
         .build()
 
-    override fun headersBuilder() = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .add("Referer", "$baseUrl/")
-        .add("Accept", "application/json")
+    override fun headersBuilder() = super.headersBuilder()
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
 
-    // ============================== اكتشاف الأعمال عبر الـ API ==============================
+    private val rscHeaders = headersBuilder()
+        .set("rsc", "1")
+        .build()
 
-    override fun popularMangaRequest(page: Int): Request {
-        // نستخدم الـ API المباشر لجلب الأكثر شهرة
-        return GET("$baseUrl/api/public/content/series?limit=18&page=$page", headers)
+    // ============================== القوائم والبحث ==============================
+
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> {
+        val filters = getFilterList().apply {
+            firstInstance<SortFilter>().state = 2
+        }
+        return fetchSearchManga(page, "", filters)
     }
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val jsonObject = json.decodeFromString<JsonObject>(response.body.string())
-        val dataArray = jsonObject["data"]?.jsonArray ?: return MangasPage(emptyList(), false)
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
+        val filters = getFilterList().apply {
+            firstInstance<SortFilter>().state = 1
+        }
+        return fetchSearchManga(page, "", filters)
+    }
 
-        val mangas = dataArray.map { element ->
-            val item = element.jsonObject
-            val id = item["id"]?.jsonPrimitive?.content ?: ""
-            val type = item["type"]?.jsonPrimitive?.content ?: "manhua"
-            val slug = item["slug"]?.jsonPrimitive?.content ?: ""
-            
-            SManga.create().apply {
-                // حفظ الرابط بالصيغة الصحيحة للموقع
-                url = "/series/$type/$id/$slug"
-                title = item["title"]?.jsonPrimitive?.content ?: ""
-                thumbnail_url = item["poster"]?.jsonPrimitive?.content ?: ""
+    private val pageNumber = ConcurrentHashMap<String, Int>()
+
+    private fun searchKey(query: String, filters: FilterList): String {
+        val filterPart = filters.filterIsInstance<Filter<*>>()
+            .joinToString("|") { it.state.toString() }
+        return "$query::$filterPart"
+    }
+
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
+        if (query.startsWith("https://")) {
+            val url = query.toHttpUrl()
+            val path = url.pathSegments
+            if (url.host == domain && path.size >= 4 && path[0] == "series") {
+                val manga = SManga.create().apply {
+                    this.url = "/series/${path[1]}/${path[2]}/${path[3]}"
+                }
+                return fetchMangaDetails(manga).map { MangasPage(listOf(it), false) }
             }
         }
-        return MangasPage(mangas, mangas.size >= 18)
-    }
 
-    override fun latestUpdatesRequest(page: Int): Request {
-        return GET("$baseUrl/api/public/content/latest-updates?limit=18&page=$page", headers)
-    }
+        val key = searchKey(query, filters)
+        if (page == 1) pageNumber[key] = 1
 
-    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
+        return client.newCall(searchMangaRequest(pageNumber[key]!!, query, filters))
+            .asObservableSuccess()
+            .map { response ->
+                val data = response.parseAs<MetaData<BrowseManga>>()
+                val statusFilter = filters.firstInstance<StatusFilter>().selected
+                
+                val mangas = data.data.filter { manga ->
+                    manga.type in SUPPORTED_TYPES && (statusFilter == null || manga.progress == statusFilter)
+                }.map { manga ->
+                    SManga.create().apply {
+                        url = "/series/${manga.type}/${manga.id}/${manga.slug}"
+                        title = manga.title
+                        thumbnail_url = (manga.coverImageApp?.desktop ?: manga.coverImage)?.let {
+                            if (it.startsWith("/")) "https://${manga.cdn ?: "cdn"}.$domain$it" else it
+                        }
+                    }
+                }
+                MangasPage(mangas, data.meta.hasNextPage())
+            }
+            .flatMap {
+                if (it.mangas.isEmpty() && it.hasNextPage) {
+                    pageNumber[key] = pageNumber[key]!! + 1
+                    fetchSearchManga(pageNumber[key]!!, query, filters)
+                } else {
+                    if (!it.hasNextPage) pageNumber.remove(key)
+                    Observable.just(it)
+                }
+            }
+    }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return GET("$baseUrl/api/public/content/series?search=$query&limit=18&page=$page", headers)
+        val url = "$baseUrl/api/public/series/search".toHttpUrl().newBuilder().apply {
+            addQueryParameter("status", "approved")
+            addQueryParameter("limit", "18")
+            addQueryParameter("page", page.toString())
+            if (query.isNotBlank()) addQueryParameter("search", query)
+            filters.firstInstance<TypeFilter>().selected?.also { addQueryParameter("type", it) }
+            addQueryParameter("sort", filters.firstInstance<SortFilter>().selected)
+            filters.firstInstance<YearFilter>().selected?.also { addQueryParameter("year", it) }
+        }.build()
+        return GET(url, headers)
     }
 
-    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+    // ============================== تفاصيل العمل ==============================
 
-    // ============================== تفاصيل العمل والفصول ==============================
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
 
-    override fun mangaDetailsParse(response: Response): SManga = throw UnsupportedOperationException("غير مستخدم")
-
-    // تجاوزنا الـ HTML وجلبنا البيانات من القائمة لسرعة الأداء
-    override fun fetchMangaDetails(manga: SManga): rx.Observable<SManga> {
-        return rx.Observable.just(manga.apply { initialized = true })
+    override fun mangaDetailsParse(response: Response): SManga {
+        val manga = response.extractNextJs<Series>()!!.series
+        return SManga.create().apply {
+            url = "/series/${manga.type}/${manga.id}/${manga.slug}"
+            title = manga.title
+            artist = manga.metadata.artist.joinToString()
+            author = manga.metadata.author.joinToString()
+            description = manga.description?.trim()
+            genre = (listOf(manga.type) + manga.metadata.genres).joinToString()
+            status = when (manga.progress?.trim()) {
+                "مستمر" -> SManga.ONGOING
+                "مكتمل" -> SManga.COMPLETED
+                else -> SManga.UNKNOWN
+            }
+            thumbnail_url = (manga.coverImageApp?.desktop ?: manga.metadata.coverImage)?.let {
+                if (it.startsWith("/")) "https://${manga.cdn ?: "cdn"}.$domain$it" else it
+            }
+            initialized = true
+        }
     }
 
-    override fun chapterListRequest(manga: SManga): Request {
-        // استخراج النوع والآيدي من الرابط /series/type/id/slug
-        val parts = manga.url.split("/")
-        val type = parts.getOrNull(2) ?: "manhua"
-        val id = parts.getOrNull(3) ?: ""
-        return GET("$baseUrl/api/public/$type/$id/chapters?limit=1000&order=desc", headers)
-    }
+    // ============================== الفصول ==============================
+
+    override fun chapterListRequest(manga: SManga) = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val jsonObject = json.decodeFromString<JsonObject>(response.body.string())
-        val chaptersData = jsonObject["data"]?.jsonArray ?: return emptyList()
+        val data = response.extractNextJs<InitialChapters>()!!
+        val chapters = data.initialChapters.toMutableList()
+        val type = response.request.url.pathSegments[1]
+        val id = response.request.url.pathSegments[2]
+        val slug = response.request.url.pathSegments[3]
 
-        return chaptersData.map { element ->
-            val item = element.jsonObject
-            SChapter.create().apply {
-                url = "/api/public/chapters/${item["id"]?.jsonPrimitive?.content}/images"
-                name = "الفصل " + (item["chapterNumber"]?.jsonPrimitive?.content ?: "")
-                date_upload = System.currentTimeMillis()
-            }
+        [span_0](start_span)// جلب الفصول الإضافية إذا وجدت[span_0](end_span)
+        var page = 2
+        while (data.totalChapters > chapters.size) {
+            val next = client.newCall(GET("$baseUrl/api/public/$type/$id/chapters?page=${page++}&limit=50&order=desc", headers)).execute()
+            if (!next.isSuccessful) break
+            chapters.addAll(next.parseAs<Data<List<Chapter>>>().data)
         }
+
+        countViews(id)
+
+        return chapters.filter { it.language == "AR" }.map { chapter ->
+            SChapter.create().apply {
+                url = "/series/$type/$id/$slug/${chapter.id}/${chapter.number}"
+                name = "الفصل ${chapter.number}" + (chapter.title?.let { " - $it" } ?: "")
+                chapter_number = chapter.number.toFloat()
+                date_upload = dateFormat.tryParse(chapter.createdAt)
+            }
+        }.sortedByDescending { it.chapter_number }
     }
 
-    // ============================== جلب الصور وفك التشفير (Scrambled Images) ==============================
+    // ============================== الصفحات وفك التشفير ==============================
+
+    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
-        val jsonObject = json.decodeFromString<JsonObject>(response.body.string())
-        val data = jsonObject["data"]?.jsonObject ?: return emptyList()
-        val maps = data["maps"]?.jsonArray ?: return emptyList()
+        val responseBody = response.body.string()
+        val imageData = responseBody.extractNextJsRsc<Images>() ?: return emptyList()
 
-        return maps.mapIndexed { index, mapElement ->
-            val map = mapElement.jsonObject
-            val pieces = map["pieces"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            val order = map["order"]?.jsonArray?.map { it.jsonPrimitive.content.toInt() } ?: emptyList()
-            val mode = map["mode"]?.jsonPrimitive?.content ?: "normal"
-            
-            // نرسل البيانات مدمجة في الرابط ليعالجها الـ Interceptor
-            val payload = "${pieces.joinToString("|")}#ORDER#${order.joinToString(",")}$#MODE#$mode"
-            Page(index, "", payload)
+        val seriesId = response.request.url.pathSegments[2]
+        val chapterId = response.request.url.pathSegments[4]
+        val chapterUrl = response.request.url.toString()
+        
+        val pages = mutableListOf<Page>()
+        imageData.images.forEachIndexed { i, url -> pages.add(Page(i, chapterUrl, url)) }
+        imageData.maps.forEachIndexed { i, map ->
+            pages.add(Page(pages.size + i, chapterUrl, "http://$SCRAMBLED_IMAGE_HOST/#${map.toJsonString()}"))
         }
+
+        countViews(seriesId, chapterId)
+        return pages
     }
 
-    private fun imageReconstructorInterceptor(chain: Interceptor.Chain): Response {
+    private fun scrambledImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val url = request.url.toString()
-        if (!url.contains("#ORDER#")) return chain.proceed(request)
+        if (request.url.host != SCRAMBLED_IMAGE_HOST) return chain.proceed(request)
 
-        val pieces = url.substringBefore("#ORDER#").split("|")
-        val order = url.substringAfter("#ORDER#").substringBefore("$").split(",").map { it.toInt() }
-        val mode = url.substringAfter("#MODE#")
-
-        val bitmaps = pieces.map { pieceUrl ->
-            val res = chain.proceed(request.newBuilder().url(pieceUrl).build())
-            BitmapFactory.decodeStream(res.body.byteStream())
+        val chapterUrl = request.header("Referer")!!
+        val cdn = when (chapterUrl.toHttpUrl().pathSegments[1]) {
+            "manga" -> "cdn1"
+            "manhua" -> "cdn2"
+            else -> "cdn3"
         }
 
-        if (bitmaps.isEmpty()) return chain.proceed(request)
+        val scrambledImage = when (val data = request.url.fragment!!.parseAs<ScrambledData>()) {
+            is ScrambledImage -> data
+            is ScrambledImageToken -> decodeScrambledImageToken(data)
+        }
 
-        val firstBmp = bitmaps[0]
-        val resultBmp = Bitmap.createBitmap(bitmaps.sumOf { it.width }, bitmaps.sumOf { it.height }, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(resultBmp)
+        val (puzzleMode, layout) = scrambledImage.mode.split("_", limit = 2)
+        val orderedPieces = scrambledImage.order.map { scrambledImage.pieces[it] }
 
-        // منطق إعادة ترتيب القطع بناءً على الـ Mode والـ Order من الـ API
-        if (mode.startsWith("grid")) {
-            val cols = 2 // الموقع حالياً يستخدم 2x2 في الغالب
-            val rows = 2
-            val tileW = firstBmp.width
-            val tileH = firstBmp.height
-            val gridResult = Bitmap.createBitmap(tileW * cols, tileH * rows, Bitmap.Config.ARGB_8888)
-            val gridCanvas = Canvas(gridResult)
-            
-            order.forEachIndexed { i, pos ->
-                val srcBmp = bitmaps[pos]
-                val x = (i % cols) * tileW
-                val y = (i / cols) * tileH
-                gridCanvas.drawBitmap(srcBmp, x.toFloat(), y.toFloat(), null)
+        val pieceBitmaps = runBlocking {
+            orderedPieces.map { pieceUrl ->
+                async(Dispatchers.IO) {
+                    val imgUrl = if (pieceUrl.startsWith("/")) "https://$cdn.$domain$pieceUrl" else pieceUrl
+                    val res = client.newCall(request.newBuilder().url(imgUrl).build()).await()
+                    val decoder = ImageDecoder.newInstance(res.body.byteStream())
+                    val bmp = decoder?.decode()
+                    decoder?.recycle()
+                    bmp ?: throw Exception("Failed to decode")
+                }
+            }.awaitAll()
+        }
+
+        val resultBitmap = Bitmap.createBitmap(scrambledImage.dim[0], scrambledImage.dim[1], Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(resultBitmap)
+
+        if (puzzleMode == "grid") {
+            val cols = layout.split('x')[0].toInt()
+            pieceBitmaps.forEachIndexed { i, bmp ->
+                canvas.drawBitmap(bmp, (i % cols * bmp.width).toFloat(), (i / cols * bmp.height).toFloat(), null)
             }
-            
-            val out = ByteArrayOutputStream()
-            gridResult.compress(Bitmap.CompressFormat.JPEG, 90, out)
-            return chain.proceed(request).newBuilder()
-                .body(out.toByteArray().toResponseBody("image/jpeg".toMediaType()))
-                .build()
+        } else {
+            var x = 0f
+            pieceBitmaps.forEach { canvas.drawBitmap(it, x, 0f, null); x += it.width }
         }
 
-        // دمج طولي بسيط إذا لم يكن هناك تشفير شبكي
-        var currentY = 0f
-        bitmaps.forEach { canvas.drawBitmap(it, 0f, currentY, null); currentY += it.height }
-        
-        val out = ByteArrayOutputStream()
-        resultBmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
-        return chain.proceed(request).newBuilder()
-            .body(out.toByteArray().toResponseBody("image/jpeg".toMediaType()))
+        val buffer = Buffer().apply { resultBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream()) }
+        pieceBitmaps.forEach { it.recycle() }
+        resultBitmap.recycle()
+
+        return Response.Builder()
+            .request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+            .body(buffer.asResponseBody("image/jpg".toMediaType(), buffer.size))
             .build()
     }
 
-    override fun imageUrlParse(response: Response): String = ""
-    override fun getFilterList() = FilterList()
-    private fun getPrefBaseUrl(): String = preferences.getString("overrideBaseUrl", "https://procomic.pro")!!
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
+    private fun decodeScrambledImageToken(data: ScrambledImageToken): ScrambledImage {
+        val value = String(urlSafeBase64(data.token), Charsets.UTF_8).parseAs<ScrambledImageTokenValue>()
+        val hash = MessageDigest.getInstance("SHA-256").digest("prochan-browser-map:2e6f9a1c4d8b7e3f0a5c9d2b6e1f4a8c7d3b0e6a9f2c5d8b1e4a7c0d3f6b9e2:${value.cid}".toByteArray())
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
+            init(Cipher.DECRYPT_MODE, SecretKeySpec(hash, "AES"), GCMParameterSpec(128, urlSafeBase64(value.iv)))
+        }
+        return String(cipher.doFinal(urlSafeBase64(value.data) + urlSafeBase64(value.tag)), Charsets.UTF_8).parseAs()
+    }
+
+    private fun urlSafeBase64(data: String) = Base64.UrlSafe.withPadding(Base64.PaddingOption.PRESENT_OPTIONAL).decode(data)
+
+    private fun countViews(seriesId: String, chapterId: String? = null) {
+        val payload = ViewsDto(chapterId?.toInt(), seriesId.toInt(), "mobile", if (chapterId == null) "series" else "chapter").toJsonString().toRequestBody(JSON_MEDIA_TYPE)
+        client.newCall(POST("$baseUrl/api/views", headers, payload)).enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) = response.closeQuietly()
+            override fun onFailure(call: Call, e: IOException) {}
+        })
+    }
+
+    override fun getFilterList() = FilterList(TypeFilter(), SortFilter(), YearFilter(), StatusFilter())
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT)
+    override fun popularMangaParse(response: Response) = throw UnsupportedOperationException()
+    override fun popularMangaRequest(page: Int) = throw UnsupportedOperationException()
+    override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
+    override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
+    override fun searchMangaParse(response: Response) = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }
+
+// ============================== النماذج والفلاتر المكملة ==============================
+
+@Serializable data class Data<T>(val data: T)
+@Serializable data class MetaData<T>(val data: List<T>, val meta: PageMeta)
+@Serializable data class PageMeta(val currentPage: Int? = null, val totalPages: Int? = null) { fun hasNextPage() = (currentPage ?: 0) < (totalPages ?: 0) }
+@Serializable data class BrowseManga(val id: Int, val title: String, val slug: String, val type: String, val progress: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val cdn: String? = null)
+@Serializable data class CoverImageApp(val desktop: String? = null)
+@Serializable data class Series(val series: MangaDetail)
+@Serializable data class MangaDetail(val id: Int, val title: String, val slug: String, val type: String, val description: String? = null, val progress: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val cdn: String? = null, val metadata: MangaMetadata)
+@Serializable data class MangaMetadata(val artist: List<String> = emptyList(), val author: List<String> = emptyList(), val genres: List<String> = emptyList(), val coverImage: String? = null)
+@Serializable data class InitialChapters(val initialChapters: List<Chapter>, val totalChapters: Int)
+@Serializable data class Chapter(val id: Int, val number: String, val title: String? = null, val language: String? = "AR", val createdAt: String)
+@Serializable data class Images(val images: List<String> = emptyList(), val maps: List<ScrambledData> = emptyList())
+@Serializable @JsonClassDiscriminator("type") sealed interface ScrambledData
+@Serializable @SerialName("image") data class ScrambledImage(val dim: List<Int>, val pieces: List<String>, val order: List<Int>, val mode: String) : ScrambledData
+@Serializable @SerialName("token") data class ScrambledImageToken(val token: String) : ScrambledData
+@Serializable data class ScrambledImageTokenValue(val iv: String, val tag: String, val data: String, val cid: Int)
+@Serializable data class ViewsDto(val chapterId: Int?, val contentId: Int, val deviceType: String, val surface: String)
+
+private val SUPPORTED_TYPES = setOf("manga", "manhwa", "manhua")
+private const val SCRAMBLED_IMAGE_HOST = "127.0.0.1"
+private val JSON_MEDIA_TYPE = "application/json".toMediaType()
+
+class TypeFilter : SelectFilter("النوع", arrayOf("الكل", "مانجا", "مانهوا", "مانهوا"), arrayOf(null, "manga", "manhwa", "manhua"))
+class SortFilter : SelectFilter("الترتيب", arrayOf("الأحدث", "المشاهدات"), arrayOf("latest", "views"))
+class YearFilter : SelectFilter("السنة", (listOf("الكل") + (2024 downTo 2010).map { it.toString() }).toTypedArray())
+class StatusFilter : SelectFilter("الحالة", arrayOf("الكل", "مستمر", "مكتمل"), arrayOf(null, "مستمر", "مكتمل"))
+open class SelectFilter(n: String, val v: Array<String>, val k: Array<String?> = emptyArray()) : Filter.Select<String>(n, v) { val selected get() = if (k.isNotEmpty()) k[state] else v[state].takeIf { it != "الكل" } }

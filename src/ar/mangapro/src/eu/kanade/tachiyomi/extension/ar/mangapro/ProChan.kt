@@ -14,15 +14,11 @@ import org.jsoup.nodes.Element
 class ProChan : HttpSource() {
 
     override val name = "ProChan"
-
     override val baseUrl = "https://procomic.pro"
-
     override val lang = "ar"
-
     override val supportsLatest = true
 
     override val client = ProChanHttp.configureClient(network.cloudflareClient, baseUrl)
-
     override fun headersBuilder() = ProChanHttp.getHeaders(baseUrl).newBuilder()
 
     override fun popularMangaRequest(page: Int): Request {
@@ -31,12 +27,10 @@ class ProChan : HttpSource() {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        
         val mangas = document.select("div.grid > div, a[href^='/series/']").mapNotNull { element: Element ->
             val link = if (element.tagName() == "a") element else element.select("a[href^='/series/']").first()
             val titleText = element.select("h3, div.text-sm, span.font-bold").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
             val img = element.select("img").attr("abs:src")
-
             if (link != null && !titleText.isNullOrEmpty()) {
                 SManga.create().apply {
                     url = link.attr("href")
@@ -45,39 +39,31 @@ class ProChan : HttpSource() {
                 }
             } else null
         }.distinctBy { it.url }
-
         val hasNextPage = document.select("button:contains(التالي), a[href*='page=']").isNotEmpty()
-        
         return MangasPage(mangas, hasNextPage)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
-
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return if (query.isNotBlank()) {
-            GET("$baseUrl/series?search=$query&page=$page", headers)
-        } else {
-            popularMangaRequest(page)
-        }
+        return if (query.isNotBlank()) GET("$baseUrl/series?search=$query", headers) else popularMangaRequest(page)
     }
-
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     override fun mangaDetailsParse(response: Response): SManga {
         return ProChanParser.mangaDetailsParse(response.asJsoup())
     }
 
+    override fun chapterListRequest(manga: SManga): Request {
+        val id = manga.url.split("/").getOrNull(3) ?: manga.url.split("/").getOrNull(2)
+        return GET("$baseUrl/api/public/series/$id", headers)
+    }
+
     override fun chapterListParse(response: Response): List<SChapter> {
-        return ProChanParser.chapterListParse(response.asJsoup())
+        return ProChanParser.chapterListParseFromJson(response)
     }
 
-    override fun pageListParse(response: Response): List<eu.kanade.tachiyomi.source.model.Page> {
-        throw UnsupportedOperationException("قيد التطوير")
-    }
-
-    override fun imageUrlParse(response: Response): String {
-        throw UnsupportedOperationException("قيد التطوير")
-    }
+    override fun pageListParse(response: Response) = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }

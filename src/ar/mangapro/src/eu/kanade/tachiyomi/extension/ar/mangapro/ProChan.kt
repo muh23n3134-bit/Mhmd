@@ -33,7 +33,7 @@ class ProChan :
     override val supportsLatest = true
     override val baseUrl by lazy { getPrefBaseUrl() }
     private val preferences by getPreferencesLazy()
-    override val versionId = 12
+    override val versionId = 13
 
     override val client = network.cloudflareClient.newBuilder()
         .rateLimit(1)
@@ -49,8 +49,8 @@ class ProChan :
     override fun popularMangaParse(response: Response): MangasPage {
         val document = Jsoup.parse(response.body.string())
         val mangas = document.select("a[href*=/series/]").mapNotNull { element ->
-            val titleText = element.select("h3, h2").text().trim()
-            if (titleText.isEmpty()) return@mapNotNull null
+            val titleText = element.select("h3, h2, p").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
+            if (titleText == null) return@mapNotNull null
             SManga.create().apply {
                 url = element.attr("href").removePrefix(baseUrl)
                 title = titleText
@@ -58,25 +58,26 @@ class ProChan :
             }
         }.distinctBy { it.url }
 
-        val hasNextPage = mangas.size >= 15
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(mangas, mangas.size >= 15)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/updates?page=$page", headers)
 
     override fun latestUpdatesParse(response: Response): MangasPage {
         val document = Jsoup.parse(response.body.string())
-        val mangas = document.select("div.grid > div").mapNotNull { element ->
-            val linkElement = element.selectFirst("a[href*=/series/]") ?: return@mapNotNull null
+        // Selector معدل لصفحة التحديثات لضمان جلب العناصر حتى لو تغير التصميم
+        val mangas = document.select("div.grid > div, a[href*=/series/]").mapNotNull { element ->
+            val linkElement = if (element.tagName() == "a") element else element.selectFirst("a[href*=/series/]")
+            if (linkElement == null) return@mapNotNull null
+            
             SManga.create().apply {
                 url = linkElement.attr("href").removePrefix(baseUrl)
-                title = element.select("h3, h2, .font-bold").first()?.text()?.trim() ?: ""
+                title = element.select("h3, h2, .font-bold").firstOrNull()?.text()?.trim() ?: ""
                 thumbnail_url = element.select("img").attr("abs:src")
             }
-        }.distinctBy { it.url }
+        }.filter { it.title.isNotBlank() }.distinctBy { it.url }
 
-        val hasNextPage = mangas.size >= 15
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(mangas, mangas.size >= 15)
     }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -103,7 +104,7 @@ class ProChan :
         return SManga.create().apply {
             title = document.select("h1").text().trim()
             description = document.select("p.text-sm.line-clamp-6, div.description").text().trim()
-            thumbnail_url = document.select("img[alt=poster]").attr("abs:src")
+            thumbnail_url = document.select("img[alt=poster], img.object-cover").firstOrNull()?.attr("abs:src") ?: ""
             author = document.select("div:contains(المؤلف) + div").text().trim()
             genre = document.select("div.flex.wrap a[href*=genres]").joinToString { it.text() }
             status = when {
@@ -165,4 +166,4 @@ class ProChan :
         }
         screen.addPreference(baseUrlPref)
     }
-    }
+}

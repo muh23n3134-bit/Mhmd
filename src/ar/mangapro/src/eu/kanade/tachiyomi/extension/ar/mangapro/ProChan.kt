@@ -48,32 +48,25 @@ class ProChan : HttpSource(), ConfigurableSource {
     override fun headersBuilder() = Headers.Builder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .add("Referer", "$baseUrl/")
-        .add("Accept", "application/json, text/plain, */*")
 
-    // ============================== MANGA LISTING (HTML) ==============================
+    // ============================== القوائم (تصحيح استخراج الروابط) ==============================
 
-    override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/series?page=$page", headers)
-    }
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/series?page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = Jsoup.parse(response.body.string())
-        val mangaElements = document.select("div.grid a[href*=/series/]")
-        
-        val mangas = mangaElements.mapNotNull { element ->
-            val href = element.attr("href")
-            // التحقق من وجود المعرف الرقمي في الرابط لضمان جودة البيانات
-            val idMatch = Regex("""/series/\w+/(\d+)""").find(href)
-            if (idMatch == null) return@mapNotNull null
-
+        // نختار الروابط التي تمثل صفحة المانجا الأساسية فقط ونبتعد عن روابط الفصول
+        val mangas = document.select("a[href*=/series/]").mapNotNull { element ->
+            val href = element.attr("abs:href")
+            val match = Regex("""/series/([^/]+)/(\d+)/([^/]+)$""").find(href) ?: return@mapNotNull null
+            
             SManga.create().apply {
                 url = href.substringAfter(baseUrl)
-                title = element.select("h3, h2, p").firstOrNull { it.text().isNotBlank() }?.text()?.trim() ?: "Unknown"
+                title = element.select("h3, h2, p, span").firstOrNull { it.text().isNotBlank() }?.text()?.trim() ?: ""
                 thumbnail_url = element.select("img").attr("abs:src")
             }
         }.distinctBy { it.url }
-
-        return MangasPage(mangas, mangas.size >= 12)
+        return MangasPage(mangas, mangas.size >= 10)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/updates?page=$page", headers)
@@ -84,140 +77,104 @@ class ProChan : HttpSource(), ConfigurableSource {
     }
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    // ============================== MANGA DETAILS ==============================
+    // ============================== تفاصيل العمل ==============================
 
     override fun mangaDetailsParse(response: Response): SManga {
         val document = Jsoup.parse(response.body.string())
         return SManga.create().apply {
-            title = document.select("h1").firstOrNull()?.text()?.trim() ?: ""
-            description = document.select("p.text-sm.line-clamp-6, div.description p").text().trim()
+            title = document.select("h1").text().trim()
+            description = document.select("p.text-sm.line-clamp-6, div.description").text().trim()
             thumbnail_url = document.select("img[alt=poster], img.object-cover").firstOrNull()?.attr("abs:src") ?: ""
-            genre = document.select("div.flex.wrap a[href*=genres]").joinToString { it.text() }
-            status = when {
-                document.text().contains("مستمر") -> SManga.ONGOING
-                document.text().contains("مكتمل") -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
+            genre = document.select("div.flex.wrap a").joinToString { it.text() }
+            status = if (document.text().contains("مستمر")) SManga.ONGOING else SManga.COMPLETED
             initialized = true
         }
     }
 
-    // ============================== CHAPTERS (API DRIVEN) ==============================
+    // ============================== الفصول (حل مشكلة النوع والـ 404) ==============================
 
     override fun chapterListRequest(manga: SManga): Request {
-        // استخراج ID المانجا باستخدام Regex لضمان الدقة حتى لو تغير الرابط
-        val mangaId = Regex("""/series/\w+/(\d+)""").find(manga.url)?.groupValues?.get(1)
-            ?: throw Exception("Could not parse Manga ID")
+        // استخراج النوع والآيدي ديناميكياً (manhua أو manhwa أو manga)
+        val match = Regex("""/series/([^/]+)/(\d+)""").find(manga.url)
+        val type = match?.groupValues?.get(1) ?: "manhua"
+        val id = match?.groupValues?.get(2) ?: ""
         
-        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?limit=1000&order=desc", headers)
+        return GET("$baseUrl/api/public/$type/$id/chapters?limit=1000&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val responseBody = response.body.string()
-        val jsonObject = json.decodeFromString<JsonObject>(responseBody)
-        val chaptersArray = jsonObject["data"]?.jsonArray ?: return emptyList()
+        val jsonString = response.body.string()
+        val jsonObject = json.decodeFromString<JsonObject>(jsonString)
+        val chaptersData = jsonObject["data"]?.jsonArray ?: return emptyList()
 
-        return chaptersArray.map { element ->
-            val chapterObj = element.jsonObject
-            val cId = chapterObj["id"]?.jsonPrimitive?.content ?: ""
-            val cNum = chapterObj["chapterNumber"]?.jsonPrimitive?.content ?: ""
-            
+        return chaptersData.map { element ->
+            val item = element.jsonObject
             SChapter.create().apply {
-                // نستخدم مساراً فريداً للفصل لتمييزه برمجياً
-                url = "/internal_api/chapter/$cId"
-                name = "الفصل $cNum"
+                // نستخدم مسار خاص للفصول لتمييزها عن السلاسل
+                url = "/chapter_api/${item["id"]?.jsonPrimitive?.content}"
+                name = "الفصل " + (item["chapterNumber"]?.jsonPrimitive?.content ?: "")
                 date_upload = System.currentTimeMillis()
             }
         }
     }
 
-    // ============================== PAGES (STITCHING LOGIC) ==============================
+    // ============================== الصفحات والدمج ==============================
 
     override fun pageListRequest(chapter: SChapter): Request {
         val chapterId = chapter.url.substringAfterLast("/")
+        // جلب الصور من الـ API العام
         return GET("$baseUrl/api/public/chapters/$chapterId/images", headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val responseBody = response.body.string()
-        val jsonObject = json.decodeFromString<JsonObject>(responseBody)
-        val dataObj = jsonObject["data"]?.jsonObject ?: return emptyList()
-        val mediaArray = dataObj["media"]?.jsonArray ?: return emptyList()
+        val jsonString = response.body.string()
+        val jsonObject = json.decodeFromString<JsonObject>(jsonString)
+        val data = jsonObject["data"]?.jsonObject ?: return emptyList()
+        val mediaArray = data["media"]?.jsonArray ?: return emptyList()
 
         return mediaArray.mapIndexed { index, element ->
-            val mediaItem = element.jsonObject
-            val partUrls = mediaItem["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            
-            // دمج الروابط في رابط واحد مع علامة مميزة للمحترض (Interceptor)
-            val joinedUrl = partUrls.joinToString("|")
-            Page(index, "", "$joinedUrl#unsplit_process")
+            val parts = element.jsonObject["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+            Page(index, "", parts.joinToString("|") + "#stitch_logic")
         }
     }
-
-    // ============================== ADVANCED IMAGE INTERCEPTOR ==============================
 
     private fun imageStitchingInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val urlString = request.url.toString()
+        val url = request.url.toString()
+        if (!url.contains("#stitch_logic")) return chain.proceed(request)
 
-        if (!urlString.contains("#unsplit_process")) return chain.proceed(request)
-
-        // تنظيف الرابط وفصل القطع
-        val cleanUrls = urlString.substringBefore("#unsplit_process").split("|")
-        
-        val bitmaps = cleanUrls.mapNotNull { partUrl ->
-            val partRequest = request.newBuilder().url(partUrl).build()
-            val partResponse = chain.proceed(partRequest)
-            if (partResponse.isSuccessful) {
-                BitmapFactory.decodeStream(partResponse.body.byteStream())
-            } else null
+        val partUrls = url.substringBefore("#stitch_logic").split("|")
+        val bitmaps = partUrls.mapNotNull {
+            val res = chain.proceed(request.newBuilder().url(it).build())
+            if (res.isSuccessful) BitmapFactory.decodeStream(res.body.byteStream()) else null
         }
 
-        if (bitmaps.isEmpty()) throw Exception("Failed to load image parts")
+        if (bitmaps.isEmpty()) return chain.proceed(request)
 
-        // حساب الأبعاد النهائية
-        val maxWidth = bitmaps.maxOf { it.width }
+        val width = bitmaps[0].width
         val totalHeight = bitmaps.sumOf { it.height }
-
-        // إنشاء الصورة المدمجة
-        val resultBitmap = Bitmap.createBitmap(maxWidth, totalHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(resultBitmap)
+        val result = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(result)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG)
 
-        var currentY = 0f
-        for (bitmap in bitmaps) {
-            canvas.drawBitmap(bitmap, 0f, currentY, paint)
-            currentY += bitmap.height
-            bitmap.recycle() // تنظيف الذاكرة فوراً
+        var y = 0f
+        bitmaps.forEach { 
+            canvas.drawBitmap(it, 0f, y, paint)
+            y += it.height
+            it.recycle() 
         }
 
-        val outputStream = ByteArrayOutputStream()
-        resultBitmap.compress(Bitmap.CompressFormat.JPEG, 85, outputStream)
-        val responseData = outputStream.toByteArray()
-        resultBitmap.recycle()
+        val out = ByteArrayOutputStream()
+        result.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        result.recycle()
 
         return chain.proceed(request).newBuilder()
-            .body(responseData.toResponseBody("image/jpeg".toMediaType()))
-            .code(200)
-            .message("OK")
+            .body(out.toByteArray().toResponseBody("image/jpeg".toMediaType()))
             .build()
     }
 
-    // ============================== CONFIGURATION & UTILS ==============================
-
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
     override fun getFilterList() = FilterList()
-
     private fun getPrefBaseUrl(): String = preferences.getString("overrideBaseUrl", "https://procomic.pro")!!
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val baseUrlPref = androidx.preference.EditTextPreference(screen.context).apply {
-            key = "overrideBaseUrl"
-            title = "Base URL"
-            setDefaultValue("https://procomic.pro")
-            summary = "تغيير الرابط الأساسي في حال تعطل الموقع"
-        }
-        screen.addPreference(baseUrlPref)
-    }
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
 }

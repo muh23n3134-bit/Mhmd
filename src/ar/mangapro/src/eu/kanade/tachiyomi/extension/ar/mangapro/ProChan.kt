@@ -89,6 +89,7 @@ class ProChan :
                     is TypeFilter -> filter.selected?.let { addQueryParameter("type", it) }
                     is StatusFilter -> filter.selected?.let { addQueryParameter("status", it) }
                     is YearFilter -> filter.selected?.let { addQueryParameter("year", it) }
+                    else -> {} 
                 }
             }
         }.build()
@@ -164,4 +165,4 @@ class ProChan :
         }
         screen.addPreference(baseUrlPref)
     }
-}
+    }

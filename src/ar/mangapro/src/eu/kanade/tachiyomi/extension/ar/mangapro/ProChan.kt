@@ -37,144 +37,100 @@ class ProChan :
     override val supportsLatest = true
     override val baseUrl by lazy { getPrefBaseUrl() }
     private val preferences by getPreferencesLazy()
-    private val apiBaseUrl = "https://procomic.pro/api/public"
-    override val versionId = 7
+    
+    override val versionId = 8
 
-    // استخدام محرك Cloudflare الخاص بالبرنامج لتخطي الحماية
     override val client = network.cloudflareClient.newBuilder()
         .rateLimit(1)
         .addInterceptor(::scrambledImageInterceptor)
         .build()
 
-    // رؤوس طلبات (Headers) تحاكي متصفح أندرويد حقيقي تماماً
-    override fun headersBuilder() = super.headersBuilder()
-        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36")
-        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+    override fun headersBuilder() = Headers.Builder()
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+        .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
         .add("Accept-Language", "ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7")
         .add("Referer", "$baseUrl/")
-        .add("sec-ch-ua-mobile", "?1")
-        .add("sec-ch-ua-platform", "\"Android\"")
-
-    private val apiHeaders: Headers by lazy {
-        headersBuilder()
-            .add("X-Requested-With", "XMLHttpRequest")
-            .set("Accept", "application/json, text/plain, */*")
-            .build()
-    }
 
     override fun popularMangaRequest(page: Int): Request {
-        val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
-            .addQueryParameter("sort", "latest")
-            .addQueryParameter("page", page.toString())
-            .build()
-        return GET(url, apiHeaders)
+        return GET("$baseUrl/series?page=$page&sort=latest", headers)
     }
 
-    override fun popularMangaParse(response: Response) = latestUpdatesParse(response)
+    override fun popularMangaParse(response: Response): MangasPage {
+        val document = Jsoup.parse(response.body.string())
+        
+        val mangas = document.select("div.grid div.relative.group").map { element ->
+            SManga.create().apply {
+                val linkElement = element.selectFirst("a[href*=/series/]")
+                url = linkElement?.attr("href")?.removePrefix(baseUrl) ?: ""
+                title = element.select("h3, h2").text().trim()
+                thumbnail_url = element.select("img").attr("abs:src")
+            }
+        }.filter { it.url.isNotBlank() }
+
+        val hasNextPage = document.selectFirst("button:contains(التالي), a:contains(التالي)") != null
+        return MangasPage(mangas, hasNextPage)
+    }
 
     override fun latestUpdatesRequest(page: Int): Request {
-        val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
-            .addQueryParameter("sort", "latest_chapter")
-            .addQueryParameter("page", page.toString())
-            .build()
-        return GET(url, apiHeaders)
+        return GET("$baseUrl/series?page=$page&sort=latest_chapter", headers)
     }
 
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val data = response.parseAs<MetaData<BrowseManga>>()
-        val mangas = data.data.map { manga ->
-            SManga.create().apply {
-                url = manga.slug
-                title = manga.title
-                thumbnail_url = manga.coverImage
-            }
-        }
-        return MangasPage(mangas, data.meta.hasNextPage())
-    }
+    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        if (query.isNotBlank()) {
-            val url = "$apiBaseUrl/series/search".toHttpUrl().newBuilder()
-                .addQueryParameter("search", query)
-                .addQueryParameter("page", page.toString())
-                .build()
-            return GET(url, apiHeaders)
-        }
-        return popularMangaRequest(page)
+        val url = "$baseUrl/series".toHttpUrl().newBuilder().apply {
+            addQueryParameter("page", page.toString())
+            if (query.isNotBlank()) addQueryParameter("search", query)
+        }.build()
+        return GET(url, headers)
     }
 
-    override fun searchMangaParse(response: Response) = latestUpdatesParse(response)
+    override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiBaseUrl/series/${manga.url}", apiHeaders)
-
-    override fun mangaDetailsParse(response: Response): SManga = response.parseAs<Series>().series.let { manga ->
-        SManga.create().apply {
-            title = manga.title
-            description = manga.description
-            thumbnail_url = manga.metadata.coverImage
-            author = manga.metadata.author.joinToString()
-            genre = manga.metadata.genres.joinToString()
+    override fun mangaDetailsParse(response: Response): SManga {
+        val document = Jsoup.parse(response.body.string())
+        return SManga.create().apply {
+            title = document.select("h1").text().trim()
+            description = document.select("p.text-sm.line-clamp-6, div.description").text().trim()
+            genre = document.select("div.flex.wrap a[href*=genres]").joinToString { it.text() }
+            author = document.select("div:contains(المؤلف) + div").text().trim()
+            thumbnail_url = document.select("img[alt=poster]").attr("abs:src")
+            status = when {
+                document.text().contains("مستمر") -> SManga.ONGOING
+                document.text().contains("مكتمل") -> SManga.COMPLETED
+                else -> SManga.UNKNOWN
+            }
             initialized = true
         }
     }
 
-    override fun chapterListRequest(manga: SManga): Request = GET("$baseUrl/series/${manga.url}", headers)
-
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = Jsoup.parse(response.body.string())
-        val scriptData = document.select("script:containsData(initialChapters)").firstOrNull()?.data()
-            ?: return emptyList()
-        
-        return try {
-            val data = scriptData.parseAs<InitialChapters>()
-            data.initialChapters.map { chapter ->
-                SChapter.create().apply {
-                    url = chapter.id.toString()
-                    name = "الفصل ${chapter.number}"
-                    date_upload = try {
-                        apiDateFormat.parse(chapter.createdAt)?.time ?: 0L
-                    } catch (e: Exception) { 0L }
-                }
+        return document.select("a[href*=/chapter/]").map { element ->
+            SChapter.create().apply {
+                url = element.attr("href").removePrefix(baseUrl)
+                name = element.select("span, p").firstOrNull()?.text()?.trim() ?: "فصل غير معروف"
+                date_upload = System.currentTimeMillis()
             }
-        } catch (e: Exception) { emptyList() }
+        }
     }
-
-    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl/chapter/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val document = Jsoup.parse(response.body.string())
-        val scriptData = document.select("script:containsData(\"images\")").firstOrNull()?.data()
-            ?: return emptyList()
-
-        return try {
-            val imageData = scriptData.parseAs<Images>()
-            imageData.images.mapIndexed { i, url ->
-                Page(i, imageUrl = url)
-            }
-        } catch (e: Exception) { emptyList() }
+        return document.select("img[src*=cdn], img.chapter-image").mapIndexed { i, img ->
+            Page(i, imageUrl = img.attr("abs:src"))
+        }
     }
 
     private fun scrambledImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (request.url.host != "scrambled") return chain.proceed(request)
-        val scrambledImage = request.url.fragment!!.parseAs<ScrambledImage>()
-        val resultBitmap = Bitmap.createBitmap(scrambledImage.dim[0], scrambledImage.dim[1], Bitmap.Config.ARGB_8888)
-        val stream = Buffer()
-        resultBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream.outputStream())
-        return Response.Builder()
-            .request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
-            .body(stream.readByteString().toResponseBody("image/png".toMediaType()))
-            .build()
+        return chain.proceed(request)
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     companion object {
-        internal val apiDateFormat by lazy {
-            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-                timeZone = TimeZone.getTimeZone("UTC")
-            }
-        }
         private const val BASE_URL_PREF = "overrideBaseUrl"
         private const val DEFAULT_BASE_URL = "https://procomic.pro"
     }

@@ -55,6 +55,7 @@ data class MangaDetails(
     val coverImageApp: CoverImageApp? = null,
     val cdn: String? = null,
     val metadata: MangaMetadata,
+    val initialChapters: InitialChapters? = null,
 )
 
 @Serializable
@@ -162,4 +163,24 @@ data class ViewsDto(
     val contentId: Int,
     val deviceType: String,
     val surface: String,
+)
+
+@Serializable
+data class NextData(
+    val props: NextProps,
+)
+
+@Serializable
+data class NextProps(
+    val pageProps: NextPageProps,
+)
+
+@Serializable
+data class NextPageProps(
+    val fallback: Map<String, NextFallback>,
+)
+
+@Serializable
+data class NextFallback(
+    val series: MangaDetails? = null,
 )

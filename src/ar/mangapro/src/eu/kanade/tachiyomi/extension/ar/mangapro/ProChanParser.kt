@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.source.model.Page
 import keiyoushi.utils.parseAs
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -20,13 +21,20 @@ object ProChanParser {
     }
 
     fun chapterListParseFromJson(response: Response): List<SChapter> {
-        val data = response.parseAs<Data<Series>>()
-        return data.data.series.initialChapters?.initialChapters?.map { chapter ->
+        val res = response.parseAs<Data<Series>>()
+        return res.data.series.initialChapters?.initialChapters?.map { chapter ->
             SChapter.create().apply {
                 url = "/chapter/${chapter.id}"
                 name = "الفصل ${chapter.number}${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
                 date_upload = Calendar.getInstance().timeInMillis
             }
         } ?: emptyList()
+    }
+
+    fun pageListParse(response: Response): List<Page> {
+        val res = response.parseAs<Data<Images>>()
+        return res.data.images.mapIndexed { i, url ->
+            Page(i, "", url)
+        }
     }
 }

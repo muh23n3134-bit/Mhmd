@@ -45,49 +45,58 @@ class ProChan : HttpSource(), ConfigurableSource {
         .build()
 
     override fun headersBuilder() = Headers.Builder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .add("Referer", "$baseUrl/")
 
-    // --- Popular & Latest ---
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/api/public/content/latest-updates?limit=18&page=$page", headers)
-    
+    override fun popularMangaRequest(page: Int): Request {
+        return GET("$baseUrl/api/public/content/latest-updates?limit=18&category=comics&page=$page", headers)
+    }
+
     override fun popularMangaParse(response: Response): MangasPage {
         val jsonString = response.body.string()
         val jsonObject = json.decodeFromString<JsonObject>(jsonString)
         val data = jsonObject["data"]?.jsonArray ?: return MangasPage(emptyList(), false)
-        
+
         val mangas = data.map { element ->
             val item = element.jsonObject
             SManga.create().apply {
-                url = "/series/${item["type"]?.jsonPrimitive?.content}/${item["id"]?.jsonPrimitive?.content}/${item["slug"]?.jsonPrimitive?.content}"
+                val type = item["type"]?.jsonPrimitive?.content ?: "manhua"
+                val id = item["id"]?.jsonPrimitive?.content ?: ""
+                val slug = item["slug"]?.jsonPrimitive?.content ?: ""
+                url = "/series/$type/$id/$slug"
                 title = item["title"]?.jsonPrimitive?.content ?: ""
                 thumbnail_url = item["poster"]?.jsonPrimitive?.content
             }
         }
-        return MangasPage(mangas, mangas.size >= 18)
+        return MangasPage(mangas, data.size >= 18)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
-    // --- Search ---
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = popularMangaRequest(page) // يمكن تطويره لاحقاً
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        return GET("$baseUrl/api/public/content/search?search=$query&page=$page&limit=18", headers)
+    }
+
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    // --- Details ---
     override fun mangaDetailsParse(response: Response): SManga {
         val document = Jsoup.parse(response.body.string())
         return SManga.create().apply {
             title = document.select("h1").text().trim()
-            description = document.select("p").text().trim()
-            thumbnail_url = document.select("img").firstOrNull()?.attr("abs:src") ?: ""
+            description = document.select("p.text-sm.line-clamp-6").text().trim()
+            thumbnail_url = document.select("img[alt=poster]").firstOrNull()?.attr("abs:src") ?: ""
+            author = document.select("div:contains(المؤلف) + div").text().trim()
+            genre = document.select("div.flex.wrap a").joinToString { it.text() }
+            status = if (document.text().contains("مستمر")) SManga.ONGOING else SManga.COMPLETED
+            initialized = true
         }
     }
 
-    // --- Chapters (تم التعديل لاستخدام الـ API الجديد) ---
     override fun chapterListRequest(manga: SManga): Request {
-        val mangaId = manga.url.split("/")[3] // استخراج الرقم (مثل 34) من الرابط
-        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?limit=100&order=desc", headers)
+        val segments = manga.url.trim('/').split("/")
+        val mangaId = if (segments.size >= 3) segments[2] else ""
+        return GET("$baseUrl/api/public/manhua/$mangaId/chapters?page=1&limit=500&order=desc", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -98,29 +107,30 @@ class ProChan : HttpSource(), ConfigurableSource {
         return chaptersData.map { element ->
             val item = element.jsonObject
             SChapter.create().apply {
-                url = "${response.request.url}/chapter/${item["id"]?.jsonPrimitive?.content}"
-                name = "الفصل ${item["chapterNumber"]?.jsonPrimitive?.content}"
+                url = "/chapter/${item["id"]?.jsonPrimitive?.content}"
+                name = "الفصل " + (item["chapterNumber"]?.jsonPrimitive?.content ?: "")
                 date_upload = System.currentTimeMillis()
             }
         }
     }
 
-    // --- Pages (نظام دمج الـ 3 قطع) ---
+    override fun pageListRequest(chapter: SChapter): Request {
+        val chapterId = chapter.url.substringAfterLast("/")
+        return GET("$baseUrl/api/public/chapters/$chapterId/images", headers)
+    }
+
     override fun pageListParse(response: Response): List<Page> {
         val jsonString = response.body.string()
         val jsonObject = json.decodeFromString<JsonObject>(jsonString)
         val mediaArray = jsonObject["data"]?.jsonObject?.get("media")?.jsonArray ?: return emptyList()
 
         return mediaArray.mapIndexed { index, element ->
-            val mediaObj = element.jsonObject
-            val parts = mediaObj["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            // ندمج روابط القطع برمز | ليقوم الـ Interceptor بمعالجتها
+            val parts = element.jsonObject["p"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
             val combinedUrl = parts.joinToString("|")
             Page(index, "", "$combinedUrl#unsplit")
         }
     }
 
-    // --- Interceptor لدمج الصور المقطعة عمودياً ---
     private fun imageStitchingInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val url = request.url.toString()
@@ -128,15 +138,13 @@ class ProChan : HttpSource(), ConfigurableSource {
         if (!url.contains("#unsplit")) return chain.proceed(request)
 
         val partUrls = url.substringBefore("#unsplit").split("|")
-        
-        // تحميل القطع
+
         val bitmaps = partUrls.map { partUrl ->
             val partRequest = request.newBuilder().url(partUrl).build()
             val response = chain.proceed(partRequest)
             BitmapFactory.decodeStream(response.body.byteStream())
         }
 
-        // دمج القطع عمودياً
         val width = bitmaps[0].width
         val totalHeight = bitmaps.sumOf { it.height }
         val result = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.ARGB_8888)
@@ -150,14 +158,24 @@ class ProChan : HttpSource(), ConfigurableSource {
 
         val output = ByteArrayOutputStream()
         result.compress(Bitmap.CompressFormat.JPEG, 90, output)
-        
+
         return chain.proceed(request).newBuilder()
             .body(output.toByteArray().toResponseBody("image/jpeg".toMediaType()))
             .build()
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
     override fun getFilterList() = FilterList()
+
     private fun getPrefBaseUrl(): String = preferences.getString("overrideBaseUrl", "https://procomic.pro")!!
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {}
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val baseUrlPref = androidx.preference.EditTextPreference(screen.context).apply {
+            key = "overrideBaseUrl"
+            title = "Base URL"
+            setDefaultValue("https://procomic.pro")
+        }
+        screen.addPreference(baseUrlPref)
+    }
 }

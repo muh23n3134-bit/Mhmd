@@ -2,9 +2,7 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.util.Log
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.await
 import eu.kanade.tachiyomi.source.model.Filter
@@ -28,8 +26,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonClassDiscriminator
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -37,12 +33,10 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
-import okhttp3.internal.closeQuietly
 import okio.Buffer
 import rx.Observable
 import tachiyomi.decoder.ImageDecoder
 import java.io.IOException
-import java.lang.UnsupportedOperationException
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -67,23 +61,13 @@ class ProChan : HttpSource() {
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
                 .header("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
-                .header("DNT", "1")
-                .header("Connection", "keep-alive")
-                .header("Upgrade-Insecure-Requests", "1")
-                .header("Sec-Fetch-Dest", "document")
-                .header("Sec-Fetch-Mode", "navigate")
-                .header("Sec-Fetch-Site", "none")
-                .header("Cache-Control", "max-age=0")
                 .build()
             chain.proceed(request)
         }
         .addNetworkInterceptor(
             CookieInterceptor(
                 domain,
-                listOf(
-                    "safe_browsing" to "off",
-                    "language" to "ar",
-                ),
+                listOf("safe_browsing" to "off", "language" to "ar"),
             ),
         )
         .build()
@@ -92,54 +76,39 @@ class ProChan : HttpSource() {
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
 
-    private val rscHeaders = headersBuilder()
-        .set("rsc", "1")
-        .build()
+    private val rscHeaders = headersBuilder().set("rsc", "1").build()
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> {
-        val filters = getFilterList().apply {
-            firstInstance<SortFilter>().state = 2
-        }
+        val filters = getFilterList().apply { firstInstance<SortFilter>().state = 2 }
         return fetchSearchManga(page, "", filters)
     }
 
     override fun fetchLatestUpdates(page: Int): Observable<MangasPage> {
-        val filters = getFilterList().apply {
-            firstInstance<SortFilter>().state = 1
-        }
+        val filters = getFilterList().apply { firstInstance<SortFilter>().state = 1 }
         return fetchSearchManga(page, "", filters)
     }
 
     private val pageNumber = ConcurrentHashMap<String, Int>()
 
-    private fun searchKey(query: String, filters: FilterList): String {
-        val filterPart = filters.filterIsInstance<Filter<*>>()
-            .joinToString("|") { it.state.toString() }
-        return "$query::$filterPart"
-    }
-
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        val key = searchKey(query, filters)
+        val key = "$query::${filters.filterIsInstance<Filter<*>>().joinToString("|") { it.state.toString() }}"
         if (page == 1) pageNumber[key] = 1
 
         return client.newCall(searchMangaRequest(pageNumber[key]!!, query, filters))
             .asObservableSuccess()
             .map { response ->
-                val responseBody = response.body.string()
-                val data = responseBody.parseAs<MetaData<BrowseManga>>()
+                val data = response.parseAs<MetaData<BrowseManga>>()
                 val statusFilter = filters.firstInstance<StatusFilter>().selected
-                
-                val mangas = data.data.filter { manga ->
-                    manga.type in SUPPORTED_TYPES && (statusFilter == null || manga.progress == statusFilter)
-                }.map { manga ->
-                    SManga.create().apply {
-                        url = "/series/${manga.type}/${manga.id}/${manga.slug}"
-                        title = manga.title
-                        thumbnail_url = (manga.coverImageApp?.desktop ?: manga.coverImage)?.let {
-                            if (it.startsWith("/")) "https://${manga.cdn ?: "cdn"}.$domain$it" else it
+                val mangas = data.data.filter { it.type in SUPPORTED_TYPES && (statusFilter == null || it.progress == statusFilter) }
+                    .map { manga ->
+                        SManga.create().apply {
+                            url = "/series/${manga.type}/${manga.id}/${manga.slug}"
+                            title = manga.title
+                            thumbnail_url = (manga.coverImageApp?.desktop ?: manga.coverImage)?.let {
+                                if (it.startsWith("/")) "https://${manga.cdn ?: "cdn"}.$domain$it" else it
+                            }
                         }
                     }
-                }
                 MangasPage(mangas, data.meta.hasNextPage())
             }
             .flatMap {
@@ -169,12 +138,8 @@ class ProChan : HttpSource() {
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun mangaDetailsParse(response: Response): SManga {
-        // FIX: Call response.body.string() FIRST to get the HTML as a String
-        val bodyString = response.body.string()
-        // Then pass the String to extractNextJs utility
-        val nextJsData = bodyString.extractNextJs<Series>() ?: throw IOException("Failed to parse details")
+        val nextJsData = response.extractNextJs<Series>() ?: throw IOException("Failed to parse details")
         val manga = nextJsData.series
-        
         return SManga.create().apply {
             url = "/series/${manga.type}/${manga.id}/${manga.slug}"
             title = manga.title
@@ -197,10 +162,7 @@ class ProChan : HttpSource() {
     override fun chapterListRequest(manga: SManga) = GET("$baseUrl${manga.url}", rscHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        // FIX: Call response.body.string() FIRST to get the HTML as a String
-        val bodyString = response.body.string()
-        // Then pass the String to extractNextJs utility
-        val data = bodyString.extractNextJs<InitialChapters>() ?: return emptyList()
+        val data = response.extractNextJs<InitialChapters>() ?: return emptyList()
         val chapters = data.initialChapters.toMutableList()
         val urlSegments = response.request.url.pathSegments
         val type = urlSegments[1]
@@ -210,8 +172,7 @@ class ProChan : HttpSource() {
         if (data.totalChapters > chapters.size) {
             val next = client.newCall(GET("$baseUrl/api/public/$type/$id/chapters?page=2&limit=100&order=desc", headers)).execute()
             if (next.isSuccessful) {
-                val nextBodyString = next.body.string()
-                chapters.addAll(nextBodyString.parseAs<Data<List<Chapter>>>().data)
+                chapters.addAll(next.parseAs<Data<List<Chapter>>>().data)
             }
         }
 
@@ -228,12 +189,9 @@ class ProChan : HttpSource() {
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", rscHeaders)
 
     override fun pageListParse(response: Response): List<Page> {
-        // FIX: Call response.body.string() FIRST to get the HTML/RSC content as a String
         val bodyString = response.body.string()
-        // Then pass the String to extractNextJsRsc utility (NOT the Response object)
         val imageData = bodyString.extractNextJsRsc<Images>() ?: return emptyList()
         val chapterUrl = response.request.url.toString()
-        
         val pages = mutableListOf<Page>()
         imageData.images.forEachIndexed { i, url -> pages.add(Page(i, chapterUrl, url)) }
         imageData.maps.forEach { map ->
@@ -246,18 +204,14 @@ class ProChan : HttpSource() {
     private fun scrambledImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (request.url.host != SCRAMBLED_IMAGE_HOST) return chain.proceed(request)
-
         val chapterUrl = request.header("Referer") ?: baseUrl
         val cdn = if (chapterUrl.contains("/manhua/")) "cdn2" else "cdn1"
-
         val scrambledImage = when (val data = request.url.fragment!!.parseAs<ScrambledData>()) {
             is ScrambledImage -> data
             is ScrambledImageToken -> decodeScrambledImageToken(data)
         }
-
         val layout = scrambledImage.mode.substringAfter("_")
         val orderedPieces = scrambledImage.order.map { scrambledImage.pieces[it] }
-
         val pieceBitmaps = runBlocking {
             orderedPieces.map { pieceUrl ->
                 async(Dispatchers.IO) {
@@ -270,10 +224,8 @@ class ProChan : HttpSource() {
                 }
             }.awaitAll()
         }
-
         val resultBitmap = Bitmap.createBitmap(scrambledImage.dim[0], scrambledImage.dim[1], Bitmap.Config.ARGB_8888)
         val canvas = Canvas(resultBitmap)
-
         if (scrambledImage.mode.startsWith("grid")) {
             val cols = layout.split('x')[0].toInt()
             pieceBitmaps.forEachIndexed { i, bmp ->
@@ -283,11 +235,9 @@ class ProChan : HttpSource() {
             var x = 0f
             pieceBitmaps.forEach { canvas.drawBitmap(it, x, 0f, null); x += it.width }
         }
-
         val buffer = Buffer().apply { resultBitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream()) }
         pieceBitmaps.forEach { it.recycle() }
         resultBitmap.recycle()
-
         return Response.Builder()
             .request(request).protocol(Protocol.HTTP_1_1).code(200).message("OK")
             .body(buffer.asResponseBody("image/jpg".toMediaType(), buffer.size))
@@ -315,121 +265,27 @@ class ProChan : HttpSource() {
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }
 
-// ============ DATA CLASSES / DTOs ============
-// All DTOs included in this file to avoid redeclaration errors
+@Serializable data class Data<T>(val data: T)
+@Serializable data class MetaData<T>(val data: List<T>, val meta: PageMeta)
+@Serializable data class PageMeta(val currentPage: Int? = null, val totalPages: Int? = null) { fun hasNextPage() = (currentPage ?: 0) < (totalPages ?: 0) }
+@Serializable data class BrowseManga(val id: Int, val title: String, val slug: String, val type: String, val progress: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val cdn: String? = null)
+@Serializable data class CoverImageApp(val desktop: String? = null)
+@Serializable data class Series(val series: MangaDetail)
+@Serializable data class MangaDetail(val id: Int, val title: String, val slug: String, val type: String, val description: String? = null, val progress: String? = null, val coverImage: String? = null, val coverImageApp: CoverImageApp? = null, val cdn: String? = null, val metadata: MangaMetadata)
+@Serializable data class MangaMetadata(val artist: List<String> = emptyList(), val author: List<String> = emptyList(), val genres: List<String> = emptyList(), val coverImage: String? = null)
+@Serializable data class InitialChapters(val initialChapters: List<Chapter>, val totalChapters: Int)
+@Serializable data class Chapter(val id: Int, val number: String, val title: String? = null, val language: String? = "AR", val createdAt: String)
+@Serializable data class Images(val images: List<String> = emptyList(), val maps: List<ScrambledData> = emptyList())
+@Serializable @JsonClassDiscriminator("type") sealed interface ScrambledData
+@Serializable @SerialName("image") data class ScrambledImage(val dim: List<Int>, val pieces: List<String>, val order: List<Int>, val mode: String) : ScrambledData
+@Serializable @SerialName("token") data class ScrambledImageToken(val token: String) : ScrambledData
+@Serializable data class ScrambledImageTokenValue(val iv: String, val tag: String, val data: String, val cid: Int)
 
-@Serializable
-data class Data<T>(val data: T)
-
-@Serializable
-data class MetaData<T>(val data: List<T>, val meta: PageMeta)
-
-@Serializable
-data class PageMeta(val currentPage: Int? = null, val totalPages: Int? = null) {
-    fun hasNextPage() = (currentPage ?: 0) < (totalPages ?: 0)
-}
-
-@Serializable
-data class BrowseManga(
-    val id: Int,
-    val title: String,
-    val slug: String,
-    val type: String,
-    val progress: String? = null,
-    val coverImage: String? = null,
-    val coverImageApp: CoverImageApp? = null,
-    val cdn: String? = null,
-)
-
-@Serializable
-data class CoverImageApp(val desktop: String? = null)
-
-@Serializable
-data class Series(val series: MangaDetail)
-
-@Serializable
-data class MangaDetail(
-    val id: Int,
-    val title: String,
-    val slug: String,
-    val type: String,
-    val description: String? = null,
-    val progress: String? = null,
-    val coverImage: String? = null,
-    val coverImageApp: CoverImageApp? = null,
-    val cdn: String? = null,
-    val metadata: MangaMetadata,
-)
-
-@Serializable
-data class MangaMetadata(
-    val artist: List<String> = emptyList(),
-    val author: List<String> = emptyList(),
-    val genres: List<String> = emptyList(),
-    val coverImage: String? = null,
-)
-
-@Serializable
-data class InitialChapters(val initialChapters: List<Chapter>, val totalChapters: Int)
-
-@Serializable
-data class Chapter(
-    val id: Int,
-    val number: String,
-    val title: String? = null,
-    val language: String? = "AR",
-    val createdAt: String,
-)
-
-@Serializable
-data class Images(
-    val images: List<String> = emptyList(),
-    val maps: List<ScrambledData> = emptyList(),
-)
-
-@Serializable
-@JsonClassDiscriminator("type")
-sealed interface ScrambledData
-
-@Serializable
-@SerialName("image")
-data class ScrambledImage(
-    val dim: List<Int>,
-    val pieces: List<String>,
-    val order: List<Int>,
-    val mode: String,
-) : ScrambledData
-
-@Serializable
-@SerialName("token")
-data class ScrambledImageToken(val token: String) : ScrambledData
-
-@Serializable
-data class ScrambledImageTokenValue(
-    val iv: String,
-    val tag: String,
-    val data: String,
-    val cid: Int,
-)
-
-// ============ CONSTANTS ============
 private val SUPPORTED_TYPES = setOf("manga", "manhwa", "manhua")
 private const val SCRAMBLED_IMAGE_HOST = "127.0.0.1"
 
-// ============ FILTER CLASSES ============
 class TypeFilter : SelectFilter("النوع", arrayOf("الكل", "مانجا", "مانهوا", "مانها"), arrayOf(null, "manga", "manhwa", "manhua"))
-
 class SortFilter : SelectFilter("الترتيب", arrayOf("الأحدث", "المشاهدات"), arrayOf("latest", "views"))
-
-class YearFilter : SelectFilter("ا��سنة", (listOf("الكل") + (2024 downTo 2010).map { it.toString() }).toTypedArray())
-
+class YearFilter : SelectFilter("السنة", (listOf("الكل") + (2024 downTo 2010).map { it.toString() }).toTypedArray())
 class StatusFilter : SelectFilter("الحالة", arrayOf("الكل", "مستمر", "مكتمل"), arrayOf(null, "مستمر", "مكتمل"))
-
-open class SelectFilter(
-    n: String,
-    val v: Array<String>,
-    val k: Array<String?> = emptyArray(),
-) : Filter.Select<String>(n, v) {
-    val selected
-        get() = if (k.isNotEmpty()) k[state] else v[state].takeIf { it != v[0] }
-}
+open class SelectFilter(n: String, val v: Array<String>, val k: Array<String?> = emptyArray()) : Filter.Select<String>(n, v) { val selected get() = if (k.isNotEmpty()) k[state] else v[state].takeIf { it != "الكل" } }

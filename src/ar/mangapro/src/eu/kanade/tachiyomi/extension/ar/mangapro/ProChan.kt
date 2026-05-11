@@ -19,44 +19,42 @@ class ProChan : HttpSource() {
     override val client = ProChanHttp.configureClient(network.cloudflareClient, baseUrl)
     override fun headersBuilder() = ProChanHttp.getHeaders(baseUrl).newBuilder()
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/series?page=$page", headers)
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/api/library?page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select("div.grid > div, a[href^='/series/']").mapNotNull { element: Element ->
-            val link = if (element.tagName() == "a") element else element.select("a[href^='/series/']").first()
-            val titleText = element.select("h3, div.text-sm, span.font-bold").firstOrNull { it.text().isNotBlank() }?.text()?.trim()
-            val img = element.select("img").attr("abs:src")
-            if (link != null && !titleText.isNullOrEmpty()) {
-                SManga.create().apply {
-                    url = link.attr("href")
-                    title = titleText
-                    thumbnail_url = img
-                }
-            } else null
-        }.distinctBy { it.url }
-        val hasNextPage = document.select("button:contains(التالي), a[href*='page=']").isNotEmpty()
-        return MangasPage(mangas, hasNextPage)
+        val res = ProChanParser.parseLibrary(response)
+        return MangasPage(res.first, res.second)
     }
 
     override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = 
-        if (query.isNotBlank()) GET("$baseUrl/series?search=$query", headers) else popularMangaRequest(page)
+        GET("$baseUrl/api/library?search=$query", headers)
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    override fun mangaDetailsParse(response: Response): SManga = ProChanParser.mangaDetailsParse(response.asJsoup())
+    override fun mangaDetailsParse(response: Response): SManga = SManga.create()
 
-    override fun chapterListRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
+    override fun chapterListRequest(manga: SManga): Request {
+        val segments = manga.url.trim('/').split("/")
+        val type = segments.getOrNull(1) ?: "manhua"
+        val id = segments.getOrNull(2) ?: ""
+        return GET("$baseUrl/api/public/$type/$id/chapters?page=1&limit=500&order=desc", headers)
+    }
 
-    override fun chapterListParse(response: Response): List<SChapter> = ProChanParser.chapterListParseFromHtml(response.asJsoup())
+    override fun chapterListParse(response: Response): List<SChapter> {
+        val mangaUrl = response.request.url.toString()
+        val segments = response.request.url.pathSegments
+        val type = segments[2]
+        val mangaId = segments[3]
+        return ProChanParser.chapterListParse(response, type, mangaId)
+    }
+
+    override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + chapter.url, headers)
 
     override fun pageListParse(response: Response): List<eu.kanade.tachiyomi.source.model.Page> {
-        val id = response.request.url.pathSegments.lastOrNull()
-        return if (id != null) {
-            val apiRequest = client.newCall(GET("$baseUrl/api/public/chapters/$id", headers)).execute()
-            ProChanParser.pageListParse(apiRequest)
-        } else emptyList()
+        val id = response.request.url.pathSegments.let { it[it.size - 2] }
+        val apiRequest = client.newCall(GET("$baseUrl/api/public/chapters/$id", headers)).execute()
+        return ProChanParser.pageListParse(apiRequest)
     }
 
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()

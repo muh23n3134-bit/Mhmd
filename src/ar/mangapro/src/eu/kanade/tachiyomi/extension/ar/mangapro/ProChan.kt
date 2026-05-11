@@ -12,18 +12,14 @@ import okhttp3.Response
 import org.jsoup.nodes.Element
 
 class ProChan : HttpSource() {
-
     override val name = "ProChan"
     override val baseUrl = "https://procomic.pro"
     override val lang = "ar"
     override val supportsLatest = true
-
     override val client = ProChanHttp.configureClient(network.cloudflareClient, baseUrl)
     override fun headersBuilder() = ProChanHttp.getHeaders(baseUrl).newBuilder()
 
-    override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/series?page=$page", headers)
-    }
+    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/series?page=$page", headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
         val document = response.asJsoup()
@@ -45,29 +41,19 @@ class ProChan : HttpSource() {
 
     override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        return if (query.isNotBlank()) GET("$baseUrl/series?search=$query", headers) else popularMangaRequest(page)
-    }
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = 
+        if (query.isNotBlank()) GET("$baseUrl/series?search=$query", headers) else popularMangaRequest(page)
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        return ProChanParser.mangaDetailsParse(response.asJsoup())
-    }
+    override fun mangaDetailsParse(response: Response): SManga = ProChanParser.mangaDetailsParse(response.asJsoup())
 
     override fun chapterListRequest(manga: SManga): Request {
         val segments = manga.url.trim('/').split("/")
-        val id = segments.firstOrNull { it.toLongOrNull() != null } ?: segments.last()
+        val id = segments.find { it.toLongOrNull() != null } ?: segments.last()
         return GET("$baseUrl/api/public/series/$id", headers)
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        return ProChanParser.chapterListParseFromJson(response)
-    }
-
-    override fun pageListParse(response: Response): List<eu.kanade.tachiyomi.source.model.Page> {
-        return ProChanParser.pageListParse(response)
-    }
-
+    override fun chapterListParse(response: Response): List<SChapter> = ProChanParser.chapterListParseFromJson(response)
+    override fun pageListParse(response: Response) = ProChanParser.pageListParse(response)
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }

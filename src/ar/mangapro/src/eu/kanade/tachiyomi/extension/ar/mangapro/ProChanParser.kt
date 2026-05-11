@@ -3,13 +3,13 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.Page
-import keiyoushi.utils.parseAs
-import okhttp3.Response
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import java.util.Calendar
 
 object ProChanParser {
-    fun parseLibrary(response: Response): Pair<List<SManga>, Boolean> {
-        val res = response.parseAs<LibraryDto>()
+    fun parseLibrary(jsonString: String, json: Json): Pair<List<SManga>, Boolean> {
+        val res = json.decodeFromString<LibraryDto>(jsonString)
         val mangas = res.library.map { item ->
             SManga.create().apply {
                 url = "/series/${item.type}/${item.id}/${item.slug}"
@@ -20,19 +20,19 @@ object ProChanParser {
         return Pair(mangas, mangas.isNotEmpty())
     }
 
-    fun chapterListParse(response: Response, type: String, mangaId: String): List<SChapter> {
-        val res = response.parseAs<ChapterListDto>()
+    fun chapterListParse(jsonString: String, json: Json): List<SChapter> {
+        val res = json.decodeFromString<ChapterResponseDto>(jsonString)
         return res.data.map { item ->
             SChapter.create().apply {
-                url = "/series/$type/$mangaId/manga/${item.id}/${item.chapter_number}"
-                name = "الفصل ${item.chapter_number}" + if (!item.title.isNullOrBlank()) " - ${item.title}" else ""
+                url = "/chapter/${item.id}"
+                name = "الفصل ${item.chapterNumber ?: ""}${if (!item.title.isNullOrBlank()) " - ${item.title}" else ""}"
                 date_upload = Calendar.getInstance().timeInMillis
             }
         }
     }
 
-    fun pageListParse(response: Response): List<Page> {
-        val res = response.parseAs<DataDto<ImagesDto>>()
+    fun pageListParse(jsonString: String, json: Json): List<Page> {
+        val res = json.decodeFromString<DataDto<ImagesDto>>(jsonString)
         return res.data.images.mapIndexed { i, url ->
             Page(i, "", url)
         }

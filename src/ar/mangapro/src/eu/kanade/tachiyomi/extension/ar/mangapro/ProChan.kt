@@ -47,13 +47,17 @@ class ProChan : HttpSource() {
 
     override fun mangaDetailsParse(response: Response): SManga = ProChanParser.mangaDetailsParse(response.asJsoup())
 
-    override fun chapterListRequest(manga: SManga): Request {
-        val segments = manga.url.trim('/').split("/")
-        val id = segments.find { it.toLongOrNull() != null } ?: segments.last()
-        return GET("$baseUrl/api/public/series/$id", headers)
+    override fun chapterListRequest(manga: SManga): Request = GET(baseUrl + manga.url, headers)
+
+    override fun chapterListParse(response: Response): List<SChapter> = ProChanParser.chapterListParseFromHtml(response.asJsoup())
+
+    override fun pageListParse(response: Response): List<eu.kanade.tachiyomi.source.model.Page> {
+        val id = response.request.url.pathSegments.lastOrNull()
+        return if (id != null) {
+            val apiRequest = client.newCall(GET("$baseUrl/api/public/chapters/$id", headers)).execute()
+            ProChanParser.pageListParse(apiRequest)
+        } else emptyList()
     }
 
-    override fun chapterListParse(response: Response): List<SChapter> = ProChanParser.chapterListParseFromJson(response)
-    override fun pageListParse(response: Response) = ProChanParser.pageListParse(response)
     override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
 }

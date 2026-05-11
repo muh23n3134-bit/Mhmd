@@ -2,10 +2,13 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 
 @Serializable
 data class LibraryDto(
-    val library: List<LibraryItem>
+    val library: List<LibraryItem> = emptyList(),
+    val recents: List<LibraryItem> = emptyList(),
+    val favorites: List<LibraryItem> = emptyList()
 )
 
 @Serializable
@@ -14,12 +17,28 @@ data class LibraryItem(
     val slug: String,
     val title: String,
     val type: String,
-    val coverImage: String
+    val coverImage: String? = null,
+    @SerialName("cdn_path") val cdnPath: String = "cdn1",
+    val metadata: LibraryItemMetadata? = null
+)
+
+@Serializable
+data class LibraryItemMetadata(
+    val descriptions: Map<String, String>? = null,
+    val coverImageApp: CoverImageApp? = null,
+    val genres: List<String>? = null,
+    val author: JsonElement? = null
+)
+
+@Serializable
+data class CoverImageApp(
+    val mobile: String? = null,
+    val desktop: String? = null
 )
 
 @Serializable
 data class ChapterListDto(
-    val data: List<ChapterItem>,
+    val data: List<ChapterItem> = emptyList(),
     val total: Int = 0
 )
 
@@ -63,6 +82,7 @@ data class MangaDetailDto(
     val description: String? = null,
     val status: String? = null,
     val coverImage: String? = null,
-    val author: String? = null,
-    val genres: List<String>? = null
+    val author: JsonElement? = null,
+    val genres: List<String>? = null,
+    val metadata: LibraryItemMetadata? = null
 )

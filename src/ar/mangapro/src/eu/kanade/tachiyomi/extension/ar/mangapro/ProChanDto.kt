@@ -22,7 +22,7 @@ data class InitialChapters(
 @Serializable
 data class Chapter(
     val id: Int,
-    val number: String,
+    val number: String = "",
     val title: String? = null
 )
 
@@ -39,14 +39,4 @@ data class ScrambledData(
     val dim: List<Int>? = null,
     val pieces: List<String>? = null,
     val order: List<Int>? = null
-)
-
-@Serializable
-data class ScrambledImageTokenValue(
-    val iv: String,
-    val tag: String,
-    val data: String,
-    val m: String,
-    val v: Int,
-    val cid: Int
 )

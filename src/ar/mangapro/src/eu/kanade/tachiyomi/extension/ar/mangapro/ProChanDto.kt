@@ -3,49 +3,35 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class Data<T>(val data: T)
-
-@Serializable
-data class NextData(val props: NextProps)
-
-@Serializable
-data class NextProps(val pageProps: PageProps)
-
-@Serializable
-data class PageProps(
-    val series: MangaDetails? = null,
-    val initialChapters: InitialChapters? = null
+data class LibraryDto(
+    val library: List<LibraryItem>
 )
 
 @Serializable
-data class MangaDetails(
+data class LibraryItem(
     val id: Int,
-    val initialChapters: InitialChapters? = null
+    val slug: String,
+    val title: String,
+    val type: String,
+    val coverImage: String
 )
 
 @Serializable
-data class InitialChapters(
-    val initialChapters: List<Chapter>
+data class ChapterListDto(
+    val data: List<ChapterItem>
 )
 
 @Serializable
-data class Chapter(
+data class ChapterItem(
     val id: Int,
-    val number: String? = null,
+    val chapter_number: String,
     val title: String? = null
 )
 
 @Serializable
-data class Images(
-    val images: List<String>,
-    val maps: List<ScrambledData>? = null
-)
+data class DataDto<T>(val data: T)
 
 @Serializable
-data class ScrambledData(
-    val token: String? = null,
-    val mode: String? = null,
-    val dim: List<Int>? = null,
-    val pieces: List<String>? = null,
-    val order: List<Int>? = null
+data class ImagesDto(
+    val images: List<String>
 )

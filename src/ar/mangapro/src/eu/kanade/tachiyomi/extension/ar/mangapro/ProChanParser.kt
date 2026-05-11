@@ -25,7 +25,8 @@ object ProChanParser {
         return res.data.series.initialChapters?.initialChapters?.map { chapter ->
             SChapter.create().apply {
                 url = "/chapter/${chapter.id}"
-                name = "الفصل ${chapter.number}${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
+                val chapterNum = chapter.number.ifBlank { chapter.id.toString() }
+                name = "الفصل $chapterNum${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
                 date_upload = Calendar.getInstance().timeInMillis
             }
         } ?: emptyList()

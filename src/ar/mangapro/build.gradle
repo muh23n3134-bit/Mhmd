@@ -1,8 +1,12 @@
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+apply plugin: 'kotlinx-serialization'
+
 ext {
-	extName = 'ProChan'
-	extClass = '.ProChan'
-	extVersionCode = 50
-	isNsfw = true
+    extName = 'ProChan'
+    extClass = '.ProChan'
+    extVersionCode = 51
+    isNsfw = true
 }
 
 apply from: "$rootDir/common.gradle"
@@ -10,4 +14,6 @@ apply from: "$rootDir/common.gradle"
 dependencies {
     compileOnly("com.github.tachiyomiorg:image-decoder:41c059e540")
     implementation(project(":lib:cookieinterceptor"))
+    
+    implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3"
 }

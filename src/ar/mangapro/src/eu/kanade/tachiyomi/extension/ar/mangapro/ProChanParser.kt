@@ -9,7 +9,6 @@ import org.jsoup.nodes.Document
 import java.util.Calendar
 
 object ProChanParser {
-
     fun mangaDetailsParse(document: Document): SManga {
         return SManga.create().apply {
             title = document.select("h1").text().trim()
@@ -21,15 +20,19 @@ object ProChanParser {
     }
 
     fun chapterListParseFromJson(response: Response): List<SChapter> {
-        val res = response.parseAs<Data<Series>>()
-        return res.data.series.initialChapters?.initialChapters?.map { chapter ->
-            SChapter.create().apply {
-                url = "/chapter/${chapter.id}"
-                val chapterNum = chapter.number.ifBlank { chapter.id.toString() }
-                name = "الفصل $chapterNum${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
-                date_upload = Calendar.getInstance().timeInMillis
-            }
-        } ?: emptyList()
+        return try {
+            val res = response.parseAs<Data<Series>>()
+            res.data.series.initialChapters?.initialChapters?.map { chapter ->
+                SChapter.create().apply {
+                    url = "/chapter/${chapter.id}"
+                    val num = if (chapter.number.isNullOrBlank()) chapter.id.toString() else chapter.number
+                    name = "الفصل $num${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
+                    date_upload = Calendar.getInstance().timeInMillis
+                }
+            } ?: emptyList()
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 
     fun pageListParse(response: Response): List<Page> {

@@ -56,8 +56,8 @@ class ProChan : HttpSource() {
     }
 
     override fun chapterListRequest(manga: SManga): Request {
-        val id = manga.url.split("/").firstOrNull { it.toLongOrNull() != null }
-            ?: manga.url.substringAfter("/series/").substringAfter("/").substringBefore("/")
+        val segments = manga.url.trim('/').split("/")
+        val id = segments.firstOrNull { it.toLongOrNull() != null } ?: segments.last()
         return GET("$baseUrl/api/public/series/$id", headers)
     }
 

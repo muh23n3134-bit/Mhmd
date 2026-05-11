@@ -5,59 +5,36 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.Page
 import keiyoushi.utils.parseAs
 import okhttp3.Response
-import org.jsoup.nodes.Document
 import java.util.Calendar
 
 object ProChanParser {
-    fun mangaDetailsParse(document: Document): SManga {
-        return SManga.create().apply {
-            title = document.select("h1").text().trim()
-            description = document.select("div.line-clamp-6, p.text-sm").firstOrNull()?.text()?.trim()
-            genre = document.select("a[href*='genre=']").joinToString { it.text() }
-            status = if (document.select("div:contains(مستمر)").isNotEmpty()) SManga.ONGOING else SManga.COMPLETED
-            thumbnail_url = document.select("img[src*='cover']").attr("abs:src")
+    fun parseLibrary(response: Response): Pair<List<SManga>, Boolean> {
+        val res = response.parseAs<LibraryDto>()
+        val mangas = res.library.map { item ->
+            SManga.create().apply {
+                url = "/series/${item.type}/${item.id}/${item.slug}"
+                title = item.title
+                thumbnail_url = if (item.coverImage.startsWith("http")) item.coverImage else "https://app.prochan.net/series" + item.coverImage
+            }
         }
+        return Pair(mangas, mangas.isNotEmpty())
     }
 
-    fun chapterListParseFromHtml(document: Document): List<SChapter> {
-        val scriptData = document.select("script#__NEXT_DATA__").firstOrNull()?.data()
-        if (scriptData != null) {
-            try {
-                val nextData = scriptData.parseAs<NextData>()
-                val chapters = nextData.props.pageProps.initialChapters?.initialChapters
-                    ?: nextData.props.pageProps.series?.initialChapters?.initialChapters
-                
-                if (!chapters.isNullOrEmpty()) {
-                    return chapters.map { chapter ->
-                        SChapter.create().apply {
-                            url = "/chapter/${chapter.id}"
-                            val num = if (chapter.number.isNullOrBlank()) chapter.id.toString() else chapter.number
-                            name = "الفصل $num${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
-                            date_upload = Calendar.getInstance().timeInMillis
-                        }
-                    }
-                }
-            } catch (e: Exception) {}
-        }
-
-        return document.select("a[href*='/chapter/']").map { element ->
+    fun chapterListParse(response: Response, type: String, mangaId: String): List<SChapter> {
+        val res = response.parseAs<ChapterListDto>()
+        return res.data.map { item ->
             SChapter.create().apply {
-                url = element.attr("href")
-                val rawName = element.select("span, p, div").firstOrNull { it.text().contains("الفصل") || it.text().any { c -> c.isDigit() } }?.text()
-                name = rawName ?: element.text().trim()
+                url = "/series/$type/$mangaId/manga/${item.id}/${item.chapter_number}"
+                name = "الفصل ${item.chapter_number}" + if (!item.title.isNullOrBlank()) " - ${item.title}" else ""
                 date_upload = Calendar.getInstance().timeInMillis
             }
-        }.distinctBy { it.url }.reversed()
+        }
     }
 
     fun pageListParse(response: Response): List<Page> {
-        return try {
-            val res = response.parseAs<Data<Images>>()
-            res.data.images.mapIndexed { i, url ->
-                Page(i, "", url)
-            }
-        } catch (e: Exception) {
-            emptyList()
+        val res = response.parseAs<DataDto<ImagesDto>>()
+        return res.data.images.mapIndexed { i, url ->
+            Page(i, "", url)
         }
     }
 }

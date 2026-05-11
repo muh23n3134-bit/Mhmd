@@ -28,5 +28,25 @@ data class Chapter(
 
 @Serializable
 data class Images(
-    val images: List<String>
+    val images: List<String>,
+    val maps: List<ScrambledData>? = null
+)
+
+@Serializable
+data class ScrambledData(
+    val token: String? = null,
+    val mode: String? = null,
+    val dim: List<Int>? = null,
+    val pieces: List<String>? = null,
+    val order: List<Int>? = null
+)
+
+@Serializable
+data class ScrambledImageTokenValue(
+    val iv: String,
+    val tag: String,
+    val data: String,
+    val m: String,
+    val v: Int,
+    val cid: Int
 )

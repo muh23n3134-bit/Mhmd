@@ -20,6 +20,26 @@ object ProChanParser {
     }
 
     fun chapterListParseFromHtml(document: Document): List<SChapter> {
+        val scriptData = document.select("script#__NEXT_DATA__").firstOrNull()?.data()
+        if (scriptData != null) {
+            try {
+                val nextData = scriptData.parseAs<NextData>()
+                val chapters = nextData.props.pageProps.initialChapters?.initialChapters
+                    ?: nextData.props.pageProps.series?.initialChapters?.initialChapters
+                
+                if (!chapters.isNullOrEmpty()) {
+                    return chapters.map { chapter ->
+                        SChapter.create().apply {
+                            url = "/chapter/${chapter.id}"
+                            val num = if (chapter.number.isNullOrBlank()) chapter.id.toString() else chapter.number
+                            name = "الفصل $num${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
+                            date_upload = Calendar.getInstance().timeInMillis
+                        }
+                    }
+                }
+            } catch (e: Exception) {}
+        }
+
         return document.select("a[href*='/chapter/']").map { element ->
             SChapter.create().apply {
                 url = element.attr("href")
@@ -27,7 +47,7 @@ object ProChanParser {
                 name = rawName ?: element.text().trim()
                 date_upload = Calendar.getInstance().timeInMillis
             }
-        }.distinctBy { it.url }
+        }.distinctBy { it.url }.reversed()
     }
 
     fun pageListParse(response: Response): List<Page> {

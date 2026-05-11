@@ -22,7 +22,7 @@ data class InitialChapters(
 @Serializable
 data class Chapter(
     val id: Int,
-    val number: String = "",
+    val number: String? = null,
     val title: String? = null
 )
 

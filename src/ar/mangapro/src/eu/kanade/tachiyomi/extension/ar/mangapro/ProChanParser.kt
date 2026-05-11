@@ -19,26 +19,25 @@ object ProChanParser {
         }
     }
 
-    fun chapterListParseFromJson(response: Response): List<SChapter> {
-        return try {
-            val res = response.parseAs<Data<Series>>()
-            res.data.series.initialChapters?.initialChapters?.map { chapter ->
-                SChapter.create().apply {
-                    url = "/chapter/${chapter.id}"
-                    val num = if (chapter.number.isNullOrBlank()) chapter.id.toString() else chapter.number
-                    name = "الفصل $num${if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""}"
-                    date_upload = Calendar.getInstance().timeInMillis
-                }
-            } ?: emptyList()
-        } catch (e: Exception) {
-            emptyList()
-        }
+    fun chapterListParseFromHtml(document: Document): List<SChapter> {
+        return document.select("a[href*='/chapter/']").map { element ->
+            SChapter.create().apply {
+                url = element.attr("href")
+                val rawName = element.select("span, p, div").firstOrNull { it.text().contains("الفصل") || it.text().any { c -> c.isDigit() } }?.text()
+                name = rawName ?: element.text().trim()
+                date_upload = Calendar.getInstance().timeInMillis
+            }
+        }.distinctBy { it.url }
     }
 
     fun pageListParse(response: Response): List<Page> {
-        val res = response.parseAs<Data<Images>>()
-        return res.data.images.mapIndexed { i, url ->
-            Page(i, "", url)
+        return try {
+            val res = response.parseAs<Data<Images>>()
+            res.data.images.mapIndexed { i, url ->
+                Page(i, "", url)
+            }
+        } catch (e: Exception) {
+            emptyList()
         }
     }
 }

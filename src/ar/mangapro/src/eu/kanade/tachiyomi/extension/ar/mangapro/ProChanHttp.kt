@@ -2,18 +2,17 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import okhttp3.Cookie
 import okhttp3.CookieJar
-import okhttp3.HttpUrl
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import java.util.concurrent.TimeUnit
 
 object ProChanHttp {
     fun getHeaders(baseUrl: String): Headers {
         return Headers.Builder()
-            .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            .add("Referer", "$baseUrl/")
-            .add("Origin", baseUrl)
+            .add("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            .add("Accept", "application/json, text/plain, */*")
+            .add("Accept-Language", "ar,en-US;q=0.7,en;q=0.3")
             .build()
     }
 

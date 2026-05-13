@@ -7,6 +7,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
@@ -35,40 +36,36 @@ class ProComic : HttpSource() {
     // =================== Popular ===================
 
     override fun popularMangaRequest(page: Int): Request {
-        val url = "$baseUrl/api/public/series".toHttpUrl().newBuilder()
-            .addQueryParameter("page", page.toString())
+        val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
-            .addQueryParameter("order", "popular")
+            .addQueryParameter("category", "comics")
+            .addQueryParameter("page", page.toString())
             .build()
         return GET(url, headers)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val data = response.parseAs<SeriesListResponse>()
-        val mangas = data.data.map { it.toSManga() }
-        val hasNextPage = data.pagination?.hasNextPage ?: false
+        val data = response.parseAs<LatestUpdatesResponse>()
+        val mangas = data.data
+            .filter { it.type != "novel" }
+            .map { it.toSManga() }
+        val hasNextPage = mangas.size >= 30
         return MangasPage(mangas, hasNextPage)
     }
 
     // =================== Latest ===================
 
-    override fun latestUpdatesRequest(page: Int): Request {
-        val url = "$baseUrl/api/public/series".toHttpUrl().newBuilder()
-            .addQueryParameter("page", page.toString())
-            .addQueryParameter("limit", "30")
-            .addQueryParameter("order", "latest")
-            .build()
-        return GET(url, headers)
-    }
+    override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // =================== Search ===================
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/api/public/series".toHttpUrl().newBuilder()
-            .addQueryParameter("page", page.toString())
+        val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
+            .addQueryParameter("category", "comics")
+            .addQueryParameter("page", page.toString())
             .addQueryParameter("q", query)
             .build()
         return GET(url, headers)
@@ -79,12 +76,28 @@ class ProComic : HttpSource() {
     // =================== Details ===================
 
     override fun mangaDetailsRequest(manga: SManga): Request {
-        return GET("$baseUrl/api/public/series/${manga.url}", headers)
+        val parts = manga.url.split("/")
+        val type = parts.getOrElse(0) { "manga" }
+        val id = parts.getOrElse(1) { "0" }
+        return GET("$baseUrl/api/public/$type/$id", headers)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
         val data = response.parseAs<SeriesDetailResponse>()
-        return data.data.toSManga()
+        return SManga.create().apply {
+            title = data.data.title ?: ""
+            thumbnail_url = data.data.coverImage
+            author = data.data.author
+            artist = data.data.artist
+            description = data.data.description
+            genre = data.data.genres?.joinToString(", ") { it.en }
+            status = when (data.data.status?.lowercase()) {
+                "ongoing", "مستمر" -> SManga.ONGOING
+                "completed", "مكتمل" -> SManga.COMPLETED
+                "hiatus" -> SManga.ON_HIATUS
+                else -> SManga.UNKNOWN
+            }
+        }
     }
 
     // =================== Chapters ===================
@@ -107,10 +120,12 @@ class ProComic : HttpSource() {
             SChapter.create().apply {
                 url = chapter.id.toString()
                 name = "الفصل ${chapter.number}"
+                    .plus(if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
                 date_upload = runCatching {
                     dateFormat.parse(chapter.publishedAt ?: "")?.time ?: 0L
                 }.getOrDefault(0L)
                 chapter_number = chapter.number.toFloatOrNull() ?: 0f
+                scanlator = if (chapter.lockedByCoins == true) "🔒 مدفوع" else null
             }
         }
     }
@@ -122,14 +137,9 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
-
-        // استخراج التوكن من الصفحة
-        val tokenRegex = Regex(""""token"\s*:\s*"([^"]+)"""")
-        val token = tokenRegex.find(html)?.groupValues?.get(1) ?: return emptyList()
-
-        // استخراج chapter ID من الـ URL
-        val chapterId = response.request.url.pathSegments.last()
+        val chapterData = response.parseAs<ChapterDetailResponse>()
+        val chapterId = chapterData.data?.id ?: return emptyList()
+        val token = chapterData.data.token ?: return emptyList()
 
         val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
             .addQueryParameter("token", token)
@@ -144,15 +154,12 @@ class ProComic : HttpSource() {
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // الصور المباشرة
         pagesData.data.images.forEach { imageUrl ->
             pages.add(Page(index++, imageUrl = imageUrl))
         }
 
-        // الصور المشفرة - إعادة الترتيب
         pagesData.data.maps.forEach { map ->
-            val ordered = reorderImages(map.pieces, map.order)
-            ordered.forEach { imageUrl ->
+            reorderImages(map.pieces, map.order).forEach { imageUrl ->
                 pages.add(Page(index++, imageUrl = imageUrl))
             }
         }
@@ -176,43 +183,74 @@ class ProComic : HttpSource() {
     // =================== Models ===================
 
     @Serializable
-    data class SeriesListResponse(
+    data class LatestUpdatesResponse(
         val success: Boolean = false,
         val data: List<SeriesDto> = emptyList(),
-        val pagination: PaginationDto? = null,
+    )
+
+    @Serializable
+    data class SeriesDto(
+        @SerialName("mangaId") val id: Int = 0,
+        @SerialName("mangaSlug") val slug: String = "",
+        @SerialName("mangaTitle") val title: String = "",
+        val coverImage: String? = null,
+        val type: String = "manga",
+        val status: String? = null,
+        val chapters: List<ChapterPreviewDto> = emptyList(),
+        val coverImageApp: CoverImageApp? = null,
+    ) {
+        fun toSManga() = SManga.create().apply {
+            url = "$type/$id"
+            title = this@SeriesDto.title
+            thumbnail_url = coverImageApp?.card?.mobile
+                ?: coverImageApp?.desktop
+                ?: coverImage
+            status = SManga.UNKNOWN
+        }
+    }
+
+    @Serializable
+    data class CoverImageApp(
+        val desktop: String? = null,
+        val card: CardImages? = null,
+    )
+
+    @Serializable
+    data class CardImages(
+        val mobile: String? = null,
+        val desktop: String? = null,
+    )
+
+    @Serializable
+    data class ChapterPreviewDto(
+        val id: Int = 0,
+        val number: String = "0",
+        val publishedAt: String? = null,
     )
 
     @Serializable
     data class SeriesDetailResponse(
         val success: Boolean = false,
-        val data: SeriesDto,
+        val data: SeriesDetailDto,
     )
 
     @Serializable
-    data class SeriesDto(
+    data class SeriesDetailDto(
         val id: Int = 0,
-        val title: String = "",
-        val slug: String = "",
-        val type: String = "manga",
-        val cover: String? = null,
+        val title: String? = null,
+        val coverImage: String? = null,
         val author: String? = null,
+        val artist: String? = null,
         val description: String? = null,
         val status: String? = null,
-    ) {
-        fun toSManga() = SManga.create().apply {
-            url = "$type/$id"
-            title = this@SeriesDto.title
-            thumbnail_url = cover
-            author = this@SeriesDto.author
-            description = this@SeriesDto.description
-            status = when (this@SeriesDto.status?.lowercase()) {
-                "ongoing" -> SManga.ONGOING
-                "completed" -> SManga.COMPLETED
-                "hiatus" -> SManga.ON_HIATUS
-                else -> SManga.UNKNOWN
-            }
-        }
-    }
+        val genres: List<GenreDto>? = null,
+    )
+
+    @Serializable
+    data class GenreDto(
+        val id: Int = 0,
+        val en: String = "",
+    )
 
     @Serializable
     data class ChaptersResponse(
@@ -226,6 +264,19 @@ class ProComic : HttpSource() {
         val number: String = "0",
         val title: String? = null,
         val publishedAt: String? = null,
+        val lockedByCoins: Boolean? = null,
+    )
+
+    @Serializable
+    data class ChapterDetailResponse(
+        val success: Boolean = false,
+        val data: ChapterDetailDto? = null,
+    )
+
+    @Serializable
+    data class ChapterDetailDto(
+        val id: Int = 0,
+        val token: String? = null,
     )
 
     @Serializable
@@ -245,10 +296,5 @@ class ProComic : HttpSource() {
     data class PageMap(
         val pieces: List<String> = emptyList(),
         val order: List<Int> = emptyList(),
-    )
-
-    @Serializable
-    data class PaginationDto(
-        val hasNextPage: Boolean = false,
     )
 }

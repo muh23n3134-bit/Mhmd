@@ -10,6 +10,8 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import java.text.SimpleDateFormat
@@ -22,142 +24,220 @@ class ProComic : HttpSource() {
     override val lang = "ar"
     override val supportsLatest = true
 
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-    }
+    private val json = Json { ignoreUnknownKeys = true }
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     override val client = network.cloudflareClient
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
-        .add("Origin", baseUrl)
 
-    // =================== Popular / Latest ===================
+    // =================== Popular ===================
 
-    override fun popularMangaRequest(page: Int): Request =
-        GET("$baseUrl/api/public/content/latest-updates?page=$page", headers)
-
-    override fun popularMangaParse(response: Response): MangasPage {
-        val jsonString = response.body.string()
-        val res = json.decodeFromString<MangaListResponse>(jsonString)
-        val mangas = res.data.map { item ->
-            SManga.create().apply {
-                // نستخدم نوع العمل (manhua/manga) في الرابط لتجنب الـ 404 لاحقاً
-                url = "/series/${item.type}/${item.id}/${item.slug}"
-                title = item.title ?: ""
-                thumbnail_url = item.coverImage?.let { 
-                    if (it.startsWith("http")) it else "https://app.prochan.net/series$it" 
-                }
-            }
-        }
-        return MangasPage(mangas, mangas.isNotEmpty())
+    override fun popularMangaRequest(page: Int): Request {
+        val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
+            .addQueryParameter("limit", "30")
+            .addQueryParameter("category", "comics")
+            .addQueryParameter("page", page.toString())
+            .build()
+        return GET(url, headers)
     }
 
-    override fun latestUpdatesRequest(page: Int): Request = popularMangaRequest(page)
+    override fun popularMangaParse(response: Response): MangasPage {
+        val data = response.parseAs<LatestUpdatesResponse>()
+        val mangas = data.data
+            .filter { it.type != "novel" }
+            .map { it.toSManga() }
+        return MangasPage(mangas, mangas.size >= 30)
+    }
+
+    // =================== Latest ===================
+
+    override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // =================== Search ===================
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request =
-        GET("$baseUrl/api/library?search=$query&page=$page", headers)
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
+            .addQueryParameter("limit", "30")
+            .addQueryParameter("category", "comics")
+            .addQueryParameter("page", page.toString())
+            .apply { if (query.isNotBlank()) addQueryParameter("q", query) }
+            .build()
+        return GET(url, headers)
+    }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
-    // =================== Manga Details ===================
+    // =================== Details ===================
 
-    override fun mangaDetailsParse(response: Response): SManga = SManga.create()
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        val parts = manga.url.split("/")
+        val type = parts.getOrElse(0) { "manga" }
+        val id = parts.getOrElse(1) { "0" }
+        return GET("$baseUrl/api/public/$type/$id", headers)
+    }
 
-    // =================== Chapter List ===================
+    override fun mangaDetailsParse(response: Response): SManga {
+        return try {
+            val data = response.parseAs<SeriesDetailResponse>()
+            SManga.create().apply {
+                title = data.title ?: ""
+                thumbnail_url = data.coverImage
+                author = data.author
+                artist = data.artist
+                description = data.synopsis ?: data.description
+                status = when (data.status?.lowercase()) {
+                    "ongoing", "مستمر" -> SManga.ONGOING
+                    "completed", "مكتمل" -> SManga.COMPLETED
+                    "hiatus" -> SManga.ON_HIATUS
+                    else -> SManga.UNKNOWN
+                }
+            }
+        } catch (e: Exception) {
+            SManga.create()
+        }
+    }
+
+    // =================== Chapters ===================
 
     override fun chapterListRequest(manga: SManga): Request {
-        val segments = manga.url.trim('/').split("/")
-        val type = segments.getOrNull(1) ?: "manhua"
-        val id = segments.getOrNull(2) ?: ""
-        return GET("$baseUrl/api/public/$type/$id/chapters?page=1&limit=500&order=desc", headers)
+        val parts = manga.url.split("/")
+        val type = parts.getOrElse(0) { "manga" }
+        val id = parts.getOrElse(1) { "0" }
+        val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl().newBuilder()
+            .addQueryParameter("page", "1")
+            .addQueryParameter("limit", "500")
+            .addQueryParameter("order", "desc")
+            .build()
+        return GET(url, headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val jsonString = response.body.string()
-        val res = json.decodeFromString<ChaptersResponse>(jsonString)
-        val mangaUrl = response.request.url.toString()
-        
-        // استخراج النوع والـ ID لبناء رابط الصفحة (Web URL)
-        val segments = response.request.url.pathSegments
-        val type = segments[2]
-        val mangaId = segments[3]
-
-        return res.data.map { item ->
+        val data = response.parseAs<ChaptersResponse>()
+        return data.data.map { chapter ->
             SChapter.create().apply {
-                // الرابط هنا يجب أن يكون رابط الويب لكي نقوم بعمل Parse له في pageList
-                url = "/series/$type/$mangaId/manga/${item.id}/${item.chapterNumber}"
-                name = "الفصل ${item.chapterNumber}"
-                date_upload = item.publishedAt?.let { parseDate(it) } ?: 0L
+                url = chapter.id.toString()
+                name = "الفصل ${chapter.chapterNumber}"
+                    .plus(if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
+                date_upload = runCatching {
+                    dateFormat.parse(chapter.publishedAt ?: "")?.time ?: 0L
+                }.getOrDefault(0L)
+                chapter_number = chapter.chapterNumber.toFloatOrNull() ?: 0f
+                scanlator = if (chapter.lockedByCoins == true) "🔒 مدفوع" else null
             }
         }
     }
 
-    // =================== Page List (حل مشكلة 404) ===================
+    // =================== Pages ===================
 
     override fun pageListRequest(chapter: SChapter): Request {
-        // نطلب صفحة الويب مباشرة لاستخراج البيانات منها
-        return GET(baseUrl + chapter.url, headers)
+        return GET("$baseUrl/api/public/chapter/${chapter.url}", headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
-        
-        // البحث عن مصفوفة الصور داخل كود الصفحة (كما في ملف 1.txt)
-        val imagesRegex = """\\"images\\":\s*\[(.*?)\]""".toRegex()
-        val match = imagesRegex.find(html)
-        
-        if (match != null) {
-            val imagesString = match.groupValues[1]
-            val imageUrls = imagesString.split(",")
-                .map { it.trim().replace("\\\"", "").replace("\"", "") }
-                .filter { it.isNotBlank() }
+        val data = response.parseAs<ChapterDetailResponse>()
+        val cdnPath = data.cdnPath ?: "cdn1"
+        val baseImageUrl = "https://$cdnPath.procomic.pro"
 
-            return imageUrls.mapIndexed { index, path ->
-                // الرابط الأساسي للصور في سيرفرات برو تشان
-                val fullUrl = if (path.startsWith("http")) path else "https://app.prochan.net/series$path"
-                Page(index, "", fullUrl)
-            }
+        val pages = mutableListOf<Page>()
+        var index = 0
+
+        // الصور المباشرة
+        data.metadata?.images?.forEach { path ->
+            val fullUrl = if (path.startsWith("http")) path else "$baseImageUrl$path"
+            pages.add(Page(index++, imageUrl = fullUrl))
         }
-        
-        throw Exception("لم يتم العثور على روابط الصور في الصفحة")
+
+        return pages
     }
 
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response) = ""
 
     // =================== Helpers ===================
 
-    private fun parseDate(dateStr: String): Long {
-        return try {
-            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).parse(dateStr)?.time ?: 0L
-        } catch (e: Exception) {
-            0L
+    private inline fun <reified T> Response.parseAs(): T {
+        return json.decodeFromStream(body.byteStream())
+    }
+
+    // =================== Models ===================
+
+    @Serializable
+    data class LatestUpdatesResponse(
+        val success: Boolean = false,
+        val data: List<SeriesDto> = emptyList(),
+    )
+
+    @Serializable
+    data class SeriesDto(
+        @SerialName("mangaId") val id: Int = 0,
+        @SerialName("mangaSlug") val slug: String = "",
+        @SerialName("mangaTitle") val title: String = "",
+        val coverImage: String? = null,
+        val type: String = "manga",
+        val coverImageApp: CoverImageApp? = null,
+    ) {
+        fun toSManga() = SManga.create().apply {
+            url = "$type/$id"
+            title = this@SeriesDto.title
+            thumbnail_url = coverImageApp?.card?.mobile
+                ?: coverImageApp?.desktop
+                ?: coverImage
+            status = SManga.UNKNOWN
         }
     }
 
     @Serializable
-    data class MangaListResponse(val data: List<MangaItem> = emptyList())
-
-    @Serializable
-    data class MangaItem(
-        val id: Int,
-        val title: String? = null,
-        val slug: String? = null,
-        val type: String? = "manhua",
-        val coverImage: String? = null
+    data class CoverImageApp(
+        val desktop: String? = null,
+        val card: CardImages? = null,
     )
 
     @Serializable
-    data class ChaptersResponse(val data: List<ChapterDto> = emptyList())
+    data class CardImages(
+        val mobile: String? = null,
+        val desktop: String? = null,
+    )
+
+    @Serializable
+    data class SeriesDetailResponse(
+        val id: Int = 0,
+        val title: String? = null,
+        val coverImage: String? = null,
+        val author: String? = null,
+        val artist: String? = null,
+        val description: String? = null,
+        val synopsis: String? = null,
+        val status: String? = null,
+    )
+
+    @Serializable
+    data class ChaptersResponse(
+        val data: List<ChapterDto> = emptyList(),
+        val total: Int = 0,
+    )
 
     @Serializable
     data class ChapterDto(
-        val id: Int,
-        @SerialName("chapter_number") val chapterNumber: String,
-        @SerialName("published_at") val publishedAt: String? = null
+        val id: Int = 0,
+        @SerialName("chapter_number") val chapterNumber: String = "0",
+        val title: String? = null,
+        @SerialName("published_at") val publishedAt: String? = null,
+        val lockedByCoins: Boolean? = null,
+    )
+
+    @Serializable
+    data class ChapterDetailResponse(
+        val id: Int = 0,
+        @SerialName("content_id") val contentId: Int = 0,
+        @SerialName("chapter_number") val chapterNumber: String = "0",
+        @SerialName("cdn_path") val cdnPath: String? = "cdn1",
+        val metadata: ChapterMetadata? = null,
+    )
+
+    @Serializable
+    data class ChapterMetadata(
+        val images: List<String> = emptyList(),
     )
 }

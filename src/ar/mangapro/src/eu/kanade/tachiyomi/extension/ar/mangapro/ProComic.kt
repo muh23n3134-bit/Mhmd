@@ -25,7 +25,6 @@ class ProComic : HttpSource() {
     override val supportsLatest = true
 
     private val json = Json { ignoreUnknownKeys = true }
-
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     override val client = network.cloudflareClient
@@ -49,14 +48,12 @@ class ProComic : HttpSource() {
         val mangas = data.data
             .filter { it.type != "novel" }
             .map { it.toSManga() }
-        val hasNextPage = mangas.size >= 30
-        return MangasPage(mangas, hasNextPage)
+        return MangasPage(mangas, mangas.size >= 30)
     }
 
     // =================== Latest ===================
 
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
-
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // =================== Search ===================
@@ -66,7 +63,7 @@ class ProComic : HttpSource() {
             .addQueryParameter("limit", "30")
             .addQueryParameter("category", "comics")
             .addQueryParameter("page", page.toString())
-            .addQueryParameter("q", query)
+            .apply { if (query.isNotBlank()) addQueryParameter("q", query) }
             .build()
         return GET(url, headers)
     }
@@ -83,20 +80,23 @@ class ProComic : HttpSource() {
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val data = response.parseAs<SeriesDetailResponse>()
-        return SManga.create().apply {
-            title = data.data.title ?: ""
-            thumbnail_url = data.data.coverImage
-            author = data.data.author
-            artist = data.data.artist
-            description = data.data.description
-            genre = data.data.genres?.joinToString(", ") { it.en }
-            status = when (data.data.status?.lowercase()) {
-                "ongoing", "مستمر" -> SManga.ONGOING
-                "completed", "مكتمل" -> SManga.COMPLETED
-                "hiatus" -> SManga.ON_HIATUS
-                else -> SManga.UNKNOWN
+        return try {
+            val data = response.parseAs<SeriesDetailResponse>()
+            SManga.create().apply {
+                title = data.title ?: ""
+                thumbnail_url = data.coverImage
+                author = data.author
+                artist = data.artist
+                description = data.synopsis ?: data.description
+                status = when (data.status?.lowercase()) {
+                    "ongoing", "مستمر" -> SManga.ONGOING
+                    "completed", "مكتمل" -> SManga.COMPLETED
+                    "hiatus" -> SManga.ON_HIATUS
+                    else -> SManga.UNKNOWN
+                }
             }
+        } catch (e: Exception) {
+            SManga.create()
         }
     }
 
@@ -108,7 +108,7 @@ class ProComic : HttpSource() {
         val id = parts.getOrElse(1) { "0" }
         val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl().newBuilder()
             .addQueryParameter("page", "1")
-            .addQueryParameter("limit", "1000")
+            .addQueryParameter("limit", "500")
             .addQueryParameter("order", "desc")
             .build()
         return GET(url, headers)
@@ -119,12 +119,12 @@ class ProComic : HttpSource() {
         return data.data.map { chapter ->
             SChapter.create().apply {
                 url = chapter.id.toString()
-                name = "الفصل ${chapter.number}"
+                name = "الفصل ${chapter.chapterNumber}"
                     .plus(if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
                 date_upload = runCatching {
                     dateFormat.parse(chapter.publishedAt ?: "")?.time ?: 0L
                 }.getOrDefault(0L)
-                chapter_number = chapter.number.toFloatOrNull() ?: 0f
+                chapter_number = chapter.chapterNumber.toFloatOrNull() ?: 0f
                 scanlator = if (chapter.lockedByCoins == true) "🔒 مدفوع" else null
             }
         }
@@ -137,31 +137,17 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val chapterData = response.parseAs<ChapterDetailResponse>()
-        val chapterId = chapterData.data?.id ?: return emptyList()
-        val token = chapterData.data.token ?: return emptyList()
-
-        val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
-            .addQueryParameter("token", token)
-            .addQueryParameter("split", "0")
-            .build()
-
-        val apiResponse = client.newCall(GET(apiUrl, headers)).execute()
-        val pagesData = apiResponse.parseAs<ChapterPagesResponse>()
-
-        if (!pagesData.success || pagesData.data == null) return emptyList()
+        val data = response.parseAs<ChapterDetailResponse>()
+        val cdnPath = data.cdnPath ?: "cdn1"
+        val baseImageUrl = "https://$cdnPath.procomic.pro"
 
         val pages = mutableListOf<Page>()
         var index = 0
 
-        pagesData.data.images.forEach { imageUrl ->
-            pages.add(Page(index++, imageUrl = imageUrl))
-        }
-
-        pagesData.data.maps.forEach { map ->
-            reorderImages(map.pieces, map.order).forEach { imageUrl ->
-                pages.add(Page(index++, imageUrl = imageUrl))
-            }
+        // الصور المباشرة
+        data.metadata?.images?.forEach { path ->
+            val fullUrl = if (path.startsWith("http")) path else "$baseImageUrl$path"
+            pages.add(Page(index++, imageUrl = fullUrl))
         }
 
         return pages
@@ -170,11 +156,6 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response) = ""
 
     // =================== Helpers ===================
-
-    private fun reorderImages(pieces: List<String>, order: List<Int>): List<String> {
-        if (order.isEmpty() || pieces.isEmpty()) return pieces
-        return order.mapNotNull { i -> pieces.getOrNull(i) }
-    }
 
     private inline fun <reified T> Response.parseAs(): T {
         return json.decodeFromStream(body.byteStream())
@@ -195,8 +176,6 @@ class ProComic : HttpSource() {
         @SerialName("mangaTitle") val title: String = "",
         val coverImage: String? = null,
         val type: String = "manga",
-        val status: String? = null,
-        val chapters: List<ChapterPreviewDto> = emptyList(),
         val coverImageApp: CoverImageApp? = null,
     ) {
         fun toSManga() = SManga.create().apply {
@@ -222,79 +201,43 @@ class ProComic : HttpSource() {
     )
 
     @Serializable
-    data class ChapterPreviewDto(
-        val id: Int = 0,
-        val number: String = "0",
-        val publishedAt: String? = null,
-    )
-
-    @Serializable
     data class SeriesDetailResponse(
-        val success: Boolean = false,
-        val data: SeriesDetailDto,
-    )
-
-    @Serializable
-    data class SeriesDetailDto(
         val id: Int = 0,
         val title: String? = null,
         val coverImage: String? = null,
         val author: String? = null,
         val artist: String? = null,
         val description: String? = null,
+        val synopsis: String? = null,
         val status: String? = null,
-        val genres: List<GenreDto>? = null,
-    )
-
-    @Serializable
-    data class GenreDto(
-        val id: Int = 0,
-        val en: String = "",
     )
 
     @Serializable
     data class ChaptersResponse(
-        val success: Boolean = false,
         val data: List<ChapterDto> = emptyList(),
+        val total: Int = 0,
     )
 
     @Serializable
     data class ChapterDto(
         val id: Int = 0,
-        val number: String = "0",
+        @SerialName("chapter_number") val chapterNumber: String = "0",
         val title: String? = null,
-        val publishedAt: String? = null,
+        @SerialName("published_at") val publishedAt: String? = null,
         val lockedByCoins: Boolean? = null,
     )
 
     @Serializable
     data class ChapterDetailResponse(
-        val success: Boolean = false,
-        val data: ChapterDetailDto? = null,
-    )
-
-    @Serializable
-    data class ChapterDetailDto(
         val id: Int = 0,
-        val token: String? = null,
+        @SerialName("content_id") val contentId: Int = 0,
+        @SerialName("chapter_number") val chapterNumber: String = "0",
+        @SerialName("cdn_path") val cdnPath: String? = "cdn1",
+        val metadata: ChapterMetadata? = null,
     )
 
     @Serializable
-    data class ChapterPagesResponse(
-        val success: Boolean = false,
-        val data: ChapterPagesData? = null,
-    )
-
-    @Serializable
-    data class ChapterPagesData(
-        val chapterId: Int = 0,
+    data class ChapterMetadata(
         val images: List<String> = emptyList(),
-        val maps: List<PageMap> = emptyList(),
-    )
-
-    @Serializable
-    data class PageMap(
-        val pieces: List<String> = emptyList(),
-        val order: List<Int> = emptyList(),
     )
 }

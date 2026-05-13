@@ -118,6 +118,7 @@ class ProComic : HttpSource() {
         val data = response.parseAs<ChaptersResponse>()
         return data.data.map { chapter ->
             SChapter.create().apply {
+                // نخزن type/seriesId/chapterId معاً في url
                 url = chapter.id.toString()
                 name = "الفصل ${chapter.chapterNumber}"
                     .plus(if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
@@ -132,25 +133,105 @@ class ProComic : HttpSource() {
 
     // =================== Pages ===================
 
+    // نحفظ في url للفصل: chapterId فقط
+    // لكن نحتاج slug وtype وseriesId لبناء HTML URL
+    // لذا سنخزنها في scanlator بشكل مؤقت من chapterListParse
+    // الحل الأفضل: نجلب HTML من pageListRequest
+
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET("$baseUrl/api/public/chapter/${chapter.url}", headers)
+        // نبني URL لصفحة الفصل من chapter.url
+        // chapter.url = chapterId مثل "37380"
+        // نحتاج نجلب الـ HTML لاستخراج التوكن
+        // لكن بما أنه لا لدينا slug هنا، نستخدم API مباشرة
+        val chapterId = chapter.url
+        return GET(
+            "$baseUrl/api/public/chapter/$chapterId",
+            headers.newBuilder()
+                .set("Accept", "application/json")
+                .build(),
+        )
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val data = response.parseAs<ChapterDetailResponse>()
-        val cdnPath = data.cdnPath ?: "cdn1"
-        val baseImageUrl = "https://$cdnPath.procomic.pro"
+        // أولاً: نجلب بيانات الفصل من API للحصول على المعلومات
+        val chapterData = response.parseAs<ChapterApiResponse>()
+        val chapterId = chapterData.id
+        val seriesId = chapterData.contentId
+        val seriesSlug = chapterData.slug ?: ""
+        val seriesType = chapterData.seriesType ?: "manga"
+        val chapterNum = chapterData.chapterNumber ?: "1"
+
+        // ثانياً: نجلب صفحة HTML لاستخراج التوكن
+        val htmlUrl = "$baseUrl/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterNum"
+        val htmlResponse = client.newCall(
+            GET(
+                htmlUrl,
+                headers.newBuilder()
+                    .set("Accept", "text/html,application/xhtml+xml")
+                    .build(),
+            ),
+        ).execute()
+
+        val html = htmlResponse.body.string()
+
+        // استخراج JWT Token من HTML
+        val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+""")
+        val token = jwtRegex.find(html)?.value
+            ?: return fallbackImages(chapterData)
+
+        // ثالثاً: نجلب الصور باستخدام التوكن
+        val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
+            .addQueryParameter("token", token)
+            .addQueryParameter("split", "0")
+            .build()
+
+        val pagesResponse = client.newCall(
+            GET(
+                apiUrl,
+                headers.newBuilder()
+                    .set("Accept", "application/json")
+                    .set("Referer", htmlUrl)
+                    .build(),
+            ),
+        ).execute()
+
+        val pagesData = pagesResponse.parseAs<ChapterDeferredResponse>()
+
+        if (!pagesData.success || pagesData.data == null) {
+            return fallbackImages(chapterData)
+        }
 
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // الصور المباشرة
-        data.metadata?.images?.forEach { path ->
-            val fullUrl = if (path.startsWith("http")) path else "$baseImageUrl$path"
-            pages.add(Page(index++, imageUrl = fullUrl))
+        // الصور المباشرة (غير مشفرة)
+        pagesData.data.images.forEach { imageUrl ->
+            pages.add(Page(index++, imageUrl = imageUrl))
+        }
+
+        // الصور المشفرة في maps - مع إعادة الترتيب
+        pagesData.data.maps.forEach { map ->
+            val ordered = if (map.order.isNotEmpty()) {
+                map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
+            } else {
+                map.pieces
+            }
+            ordered.forEach { imageUrl ->
+                pages.add(Page(index++, imageUrl = imageUrl))
+            }
         }
 
         return pages
+    }
+
+    // fallback: نستخدم الصور من API مباشرة إذا فشل التوكن
+    private fun fallbackImages(chapterData: ChapterApiResponse): List<Page> {
+        val cdnPath = chapterData.cdnPath ?: "cdn1"
+        val baseImageUrl = "https://$cdnPath.procomic.pro"
+        return chapterData.metadata?.images?.mapIndexed { i, path ->
+            val fullUrl = if (path.startsWith("http")) path else "$baseImageUrl$path"
+            Page(i, imageUrl = fullUrl)
+        } ?: emptyList()
     }
 
     override fun imageUrlParse(response: Response) = ""
@@ -228,16 +309,37 @@ class ProComic : HttpSource() {
     )
 
     @Serializable
-    data class ChapterDetailResponse(
+    data class ChapterApiResponse(
         val id: Int = 0,
         @SerialName("content_id") val contentId: Int = 0,
-        @SerialName("chapter_number") val chapterNumber: String = "0",
+        @SerialName("chapter_number") val chapterNumber: String? = null,
         @SerialName("cdn_path") val cdnPath: String? = "cdn1",
+        val slug: String? = null,
+        @SerialName("series_type") val seriesType: String? = null,
         val metadata: ChapterMetadata? = null,
     )
 
     @Serializable
     data class ChapterMetadata(
         val images: List<String> = emptyList(),
+    )
+
+    @Serializable
+    data class ChapterDeferredResponse(
+        val success: Boolean = false,
+        val data: ChapterDeferredData? = null,
+    )
+
+    @Serializable
+    data class ChapterDeferredData(
+        val chapterId: Int = 0,
+        val images: List<String> = emptyList(),
+        val maps: List<PageMap> = emptyList(),
+    )
+
+    @Serializable
+    data class PageMap(
+        val pieces: List<String> = emptyList(),
+        val order: List<Int> = emptyList(),
     )
 }

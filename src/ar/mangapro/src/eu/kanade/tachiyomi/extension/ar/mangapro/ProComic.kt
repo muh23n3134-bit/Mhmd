@@ -33,7 +33,7 @@ class ProComic : HttpSource() {
     private val json = Json { ignoreUnknownKeys = true }
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    // Interceptor محسّن لدمج الصور
+    // Interceptor لدمج الصور المقطعة
     override val client = network.cloudflareClient.newBuilder()
         .addInterceptor(ImageMergeInterceptor())
         .build()
@@ -43,19 +43,14 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
-            // التحقق من وجود علامة الدمج
             if (!url.contains("#merge")) {
                 return chain.proceed(request)
             }
 
             return try {
-                // استخراج روابط القطع
                 val pieceUrls = url.substringBefore("#merge").split("|")
-                
-                // تحميل ودمج الصور
                 val mergedImage = downloadAndMergeImages(chain, request, pieceUrls)
                 
-                // إنشاء الاستجابة
                 Response.Builder()
                     .request(request)
                     .protocol(okhttp3.Protocol.HTTP_1_1)
@@ -64,7 +59,6 @@ class ProComic : HttpSource() {
                     .body(mergedImage.toResponseBody("image/jpeg".toMediaType()))
                     .build()
             } catch (e: Exception) {
-                // في حالة الفشل، إرجاع خطأ واضح
                 Response.Builder()
                     .request(request)
                     .protocol(okhttp3.Protocol.HTTP_1_1)
@@ -83,7 +77,6 @@ class ProComic : HttpSource() {
             val bitmaps = mutableListOf<Bitmap>()
             
             try {
-                // تحميل كل القطع مع الـ headers الصحيحة
                 pieceUrls.forEach { pieceUrl ->
                     val pieceRequest = originalRequest.newBuilder()
                         .url(pieceUrl)
@@ -105,11 +98,9 @@ class ProComic : HttpSource() {
                     bitmaps.add(bitmap)
                 }
 
-                // حساب الأبعاد
                 val maxWidth = bitmaps.maxOf { it.width }
                 val totalHeight = bitmaps.sumOf { it.height }
 
-                // دمج الصور
                 val mergedBitmap = Bitmap.createBitmap(
                     maxWidth,
                     totalHeight,
@@ -124,17 +115,14 @@ class ProComic : HttpSource() {
                     currentY += bitmap.height
                 }
 
-                // تحويل إلى ByteArray
                 val output = ByteArrayOutputStream()
                 mergedBitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)
                 val result = output.toByteArray()
                 
-                // تنظيف الذاكرة
                 mergedBitmap.recycle()
                 
                 return result
             } finally {
-                // تنظيف كل الـ bitmaps
                 bitmaps.forEach { it.recycle() }
             }
         }
@@ -232,9 +220,7 @@ class ProComic : HttpSource() {
                 url = "$seriesType/$seriesId/${chapter.id}/${chapter.chapterNumber}"
                 name = "الفصل ${chapter.chapterNumber}" +
                     (if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
-                date_upload = runCatching {
-                    dateFormat.parse(chapter.publishedAt ?: "")?.time
-                }.getOrNull() ?: 0L
+                date_upload = runCatching { dateFormat.parse(chapter.publishedAt ?: "")?.time }.getOrNull() ?: 0L
                 chapter_number = chapter.chapterNumber.toFloatOrNull() ?: 0f
             }
         }
@@ -246,150 +232,95 @@ class ProComic : HttpSource() {
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
-        val chapterNumber = parts.getOrElse(3) { "1" }
-
-        val slugResponse = client.newCall(
-            GET("$baseUrl/api/public/$seriesType/$seriesId", headers)
-        ).execute()
         
-        val seriesSlug = try {
-            slugResponse.parseAs<SeriesDetailResponse>().slug ?: seriesId
-        } catch (e: Exception) {
-            seriesId
-        }
-
-        return GET(
-            "$baseUrl/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterNumber",
-            headers
-        )
+        val url = "$baseUrl/api/public/$seriesType/$seriesId/chapters/$chapterId"
+        return GET(url, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
-        val urlParts = response.request.url.toString().split("/")
-        val chapterId = urlParts.getOrElse(urlParts.size - 2) { "0" }
-
-        val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")
-        val token = jwtRegex.find(html)?.value ?: return emptyList()
-
-        val pagesResponse = client.newCall(
-            GET("$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0", headers)
-        ).execute()
-        
-        val pagesData = pagesResponse.parseAs<ChapterDeferredResponse>()
-
-        if (!pagesData.success || pagesData.data == null) return emptyList()
-
+        val data = response.parseAs<ChapterDetailResponse>()
         val pages = mutableListOf<Page>()
-        var index = 0
-
-        // الصور العادية
-        pagesData.data.images.forEach { imageUrl ->
-            pages.add(Page(index++, imageUrl = imageUrl))
-        }
-
-        // الصور المقطعة
-        pagesData.data.maps.forEach { map ->
-            val ordered = if (map.order.isNotEmpty()) {
-                map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
-            } else {
-                map.pieces
-            }
-            
-            if (ordered.isNotEmpty()) {
-                val mergedUrl = ordered.joinToString("|") + "#merge"
-                pages.add(Page(index++, imageUrl = mergedUrl))
+        
+        data.pages?.forEachIndexed { index, pageData ->
+            when {
+                // صورة مقطعة
+                pageData.pieces != null && pageData.pieces.isNotEmpty() -> {
+                    val mergedUrl = pageData.pieces.joinToString("|") + "#merge"
+                    pages.add(Page(index, "", mergedUrl))
+                }
+                // صورة عادية
+                !pageData.image.isNullOrBlank() -> {
+                    pages.add(Page(index, "", pageData.image))
+                }
             }
         }
-
+        
         return pages
     }
 
-    override fun imageUrlParse(response: Response): String = ""
+    override fun imageUrlParse(response: Response): String {
+        throw UnsupportedOperationException("Not used")
+    }
 
-    private inline fun <reified T> Response.parseAs(): T =
-        json.decodeFromStream(body.byteStream())
-
-    // =================== Models ===================
+    // =================== Data Classes ===================
     @Serializable
     data class LatestUpdatesResponse(
-        val success: Boolean = false,
-        val data: List<SeriesDto> = emptyList()
+        val data: List<SeriesItem>
     )
 
     @Serializable
-    data class SeriesDto(
-        @SerialName("mangaId") val id: Int = 0,
-        @SerialName("mangaSlug") val slug: String = "",
-        @SerialName("mangaTitle") val title: String = "",
-        val coverImage: String? = null,
-        val type: String = "manga",
-        val coverImageApp: CoverImageApp? = null
+    data class SeriesItem(
+        val id: Int,
+        val title: String? = null,
+        val slug: String? = null,
+        val type: String? = null,
+        @SerialName("cover_image") val coverImage: String? = null
     ) {
         fun toSManga() = SManga.create().apply {
-            url = "$type/$id/$slug"
-            title = this@SeriesDto.title
-            thumbnail_url = coverImageApp?.card?.mobile
-                ?: coverImageApp?.desktop
-                ?: coverImage
+            url = "${type ?: "manga"}/$id/$slug"
+            title = this@SeriesItem.title ?: ""
+            thumbnail_url = coverImage
         }
     }
 
     @Serializable
-    data class CoverImageApp(
-        val desktop: String? = null,
-        val card: CardImages? = null
-    )
-
-    @Serializable
-    data class CardImages(
-        val mobile: String? = null,
-        val desktop: String? = null
-    )
-
-    @Serializable
     data class SeriesDetailResponse(
-        val id: Int = 0,
+        val id: Int,
         val title: String? = null,
         val slug: String? = null,
-        val coverImage: String? = null,
+        val synopsis: String? = null,
+        val description: String? = null,
         val author: String? = null,
         val artist: String? = null,
-        val description: String? = null,
-        val synopsis: String? = null,
-        val status: String? = null
+        val status: String? = null,
+        @SerialName("cover_image") val coverImage: String? = null
     )
 
     @Serializable
     data class ChaptersResponse(
-        val data: List<ChapterDto> = emptyList()
+        val data: List<ChapterItem>
     )
 
     @Serializable
-    data class ChapterDto(
-        val id: Int = 0,
-        @SerialName("chapter_number") val chapterNumber: String = "0",
+    data class ChapterItem(
+        val id: Int,
+        @SerialName("chapter_number") val chapterNumber: String,
         val title: String? = null,
-        @SerialName("published_at") val publishedAt: String? = null,
-        val lockedByCoins: Boolean? = null
+        @SerialName("published_at") val publishedAt: String? = null
     )
 
     @Serializable
-    data class ChapterDeferredResponse(
-        val success: Boolean = false,
-        val data: ChapterDeferredData? = null
+    data class ChapterDetailResponse(
+        val pages: List<PageData>? = null
     )
 
     @Serializable
-    data class ChapterDeferredData(
-        val chapterId: Int = 0,
-        val images: List<String> = emptyList(),
-        val maps: List<PageMap> = emptyList()
+    data class PageData(
+        val image: String? = null,
+        val pieces: List<String>? = null
     )
 
-    @Serializable
-    data class PageMap(
-        val pieces: List<String> = emptyList(),
-        val order: List<Int> = emptyList()
-    )
+    private inline fun <reified T> Response.parseAs(): T {
+        return json.decodeFromStream(body.byteStream())
+    }
 }

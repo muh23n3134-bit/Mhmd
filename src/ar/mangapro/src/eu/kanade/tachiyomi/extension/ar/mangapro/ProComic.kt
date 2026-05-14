@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -85,18 +86,15 @@ class ProComic : HttpSource() {
 
                     val response = chain.proceed(pieceRequest)
                     if (!response.isSuccessful) {
-                        throw Exception("HTTP ${response.code} for $pieceUrl")
+                        throw Exception("HTTP ${response.code}")
                     }
 
                     val bytes = response.body.bytes()
                     response.close()
 
-                    // استخدام image-decoder لدعم AVIF
-                    val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                ?: throw Exception("فشل فك تشفير الصورة")
-                bitmaps.add(bitmap)
-                    image.render(bitmap)
-                    image.recycle()
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        ?: throw Exception("فشل فك تشفير الصورة")
+
                     bitmaps.add(bitmap)
                 }
 
@@ -126,8 +124,6 @@ class ProComic : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
-    // =================== Popular ===================
-
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
@@ -143,12 +139,8 @@ class ProComic : HttpSource() {
         return MangasPage(mangas, mangas.size >= 30)
     }
 
-    // =================== Latest ===================
-
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    // =================== Search ===================
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
@@ -161,8 +153,6 @@ class ProComic : HttpSource() {
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
-
-    // =================== Details ===================
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
@@ -197,8 +187,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // =================== Chapters ===================
-
     override fun chapterListRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
@@ -231,8 +219,6 @@ class ProComic : HttpSource() {
             }
         }
     }
-
-    // =================== Pages ===================
 
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
@@ -271,9 +257,7 @@ class ProComic : HttpSource() {
         val pagesResponse = client.newCall(
             GET(
                 "$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0",
-                headers.newBuilder()
-                    .set("Accept", "application/json")
-                    .build(),
+                headers.newBuilder().set("Accept", "application/json").build(),
             ),
         ).execute()
 
@@ -283,12 +267,10 @@ class ProComic : HttpSource() {
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // الصور الكاملة
         pagesData.data.images.forEach { imageUrl ->
             pages.add(Page(index++, imageUrl = imageUrl))
         }
 
-        // الصور المقطعة - مع إعادة الترتيب
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -307,8 +289,6 @@ class ProComic : HttpSource() {
 
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())
-
-    // =================== Models ===================
 
     @Serializable
     data class LatestUpdatesResponse(

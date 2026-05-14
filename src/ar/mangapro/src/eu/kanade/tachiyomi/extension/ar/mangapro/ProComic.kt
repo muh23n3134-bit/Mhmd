@@ -19,7 +19,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import rx.Observable
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -34,7 +33,54 @@ class ProComic : HttpSource() {
     private val json = Json { ignoreUnknownKeys = true }
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    override val client = network.cloudflareClient
+    // تعديل العميل لإضافة "مراقب التجميع"
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url.toString()
+
+            if (url.contains("#merge")) {
+                // استخراج الروابط الحقيقية من الرابط المدمج
+                val realUrls = url.substringBefore("#merge").split("|")
+                
+                val bitmaps = realUrls.map { pieceUrl ->
+                    val pieceRequest = request.newBuilder().url(pieceUrl).build()
+                    val response = chain.proceed(pieceRequest)
+                    val bitmap = BitmapFactory.decodeStream(response.body.byteStream())
+                    response.close()
+                    bitmap ?: throw Exception("فشل تحميل قطعة الصورة")
+                }
+
+                // دمج الصور
+                val width = bitmaps.maxOf { it.width }
+                val height = bitmaps.sumOf { it.height }
+                val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(result)
+
+                var currentY = 0f
+                bitmaps.forEach { bitmap ->
+                    canvas.drawBitmap(bitmap, 0f, currentY, null)
+                    currentY += bitmap.height
+                    bitmap.recycle()
+                }
+
+                val output = ByteArrayOutputStream()
+                result.compress(Bitmap.CompressFormat.JPEG, 85, output)
+                val byteArray = output.toByteArray()
+                result.recycle()
+
+                Response.Builder()
+                    .request(request)
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(byteArray.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
+            } else {
+                chain.proceed(request)
+            }
+        }
+        .build()
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
@@ -98,7 +144,6 @@ class ProComic : HttpSource() {
                 status = when (data.status?.lowercase()) {
                     "ongoing", "مستمر" -> SManga.ONGOING
                     "completed", "مكتمل" -> SManga.COMPLETED
-                    "hiatus" -> SManga.ON_HIATUS
                     else -> SManga.UNKNOWN
                 }
             }
@@ -162,10 +207,12 @@ class ProComic : HttpSource() {
         val pages = mutableListOf<Page>()
         var index = 0
 
+        // إضافة الصور العادية
         pagesData.data.images.forEach { imageUrl ->
             pages.add(Page(index++, imageUrl = imageUrl))
         }
 
+        // إرسال روابط القطع مدمجة للمراقب
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -173,61 +220,10 @@ class ProComic : HttpSource() {
                 map.pieces
             }
             if (ordered.isNotEmpty()) {
-                // ندمج الروابط بفاصل | ونضيف علامة #merge ليميزها النظام
                 pages.add(Page(index++, imageUrl = ordered.joinToString("|") + "#merge"))
             }
         }
         return pages
-    }
-
-    // هذه الدالة هي المسؤولة عن معالجة طلبات الصور (بما في ذلك الدمج)
-    override fun fetchImage(page: Page): Observable<Response> {
-        val url = page.imageUrl ?: return Observable.error(Exception("الرابط غير موجود"))
-        
-        if (url.contains("#merge")) {
-            return Observable.fromCallable {
-                val realUrls = url.substringBefore("#merge").split("|")
-                val bitmaps = realUrls.map { pieceUrl ->
-                    val response = client.newCall(GET(pieceUrl, headers)).execute()
-                    if (!response.isSuccessful) {
-                        response.close()
-                        throw Exception("فشل تحميل القطعة: $pieceUrl")
-                    }
-                    val bitmap = BitmapFactory.decodeStream(response.body?.byteStream())
-                    response.close()
-                    bitmap ?: throw Exception("فشل تحويل البيانات لصورة")
-                }
-
-                // حساب أبعاد الصورة النهائية
-                val width = bitmaps.maxOf { it.width }
-                val height = bitmaps.sumOf { it.height }
-                val result = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(result)
-
-                // دمج القطع فوق بعضها
-                var currentY = 0f
-                bitmaps.forEach { bitmap ->
-                    canvas.drawBitmap(bitmap, 0f, currentY, null)
-                    currentY += bitmap.height
-                    bitmap.recycle() // تنظيف الذاكرة
-                }
-
-                val output = ByteArrayOutputStream()
-                result.compress(Bitmap.CompressFormat.JPEG, 85, output)
-                val byteArray = output.toByteArray()
-                result.recycle()
-
-                Response.Builder()
-                    .protocol(okhttp3.Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(byteArray.toResponseBody("image/jpeg".toMediaType()))
-                    .request(GET(realUrls[0], headers))
-                    .build()
-            }
-        }
-        
-        return super.fetchImage(page)
     }
 
     override fun imageUrlParse(response: Response): String = ""

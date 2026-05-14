@@ -1,13 +1,12 @@
 ext {
-	extName = 'ProComic'
-	extClass = '.ProComic'
-	extVersionCode = 48
-	isNsfw = true
+    extName = 'ProComic'
+    extClass = '.ProComic'
+    extVersionCode = 49
+    isNsfw = true
 }
 
 apply from: "$rootDir/common.gradle"
 
 dependencies {
-    compileOnly("com.github.tachiyomiorg:image-decoder:41c059e540")
-    implementation(project(":lib:cookieinterceptor"))
+    implementation(project(":lib:image-decoder"))
 }

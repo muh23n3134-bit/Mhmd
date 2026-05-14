@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import com.hippo.image.Image
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -93,14 +92,9 @@ class ProComic : HttpSource() {
                     response.close()
 
                     // استخدام image-decoder لدعم AVIF
-                    val image = Image.decode(bytes.inputStream(), false)
-                        ?: throw Exception("فشل فك تشفير AVIF")
-
-                    val bitmap = Bitmap.createBitmap(
-                        image.width,
-                        image.height,
-                        Bitmap.Config.ARGB_8888,
-                    )
+                    val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                ?: throw Exception("فشل فك تشفير الصورة")
+                bitmaps.add(bitmap)
                     image.render(bitmap)
                     image.recycle()
                     bitmaps.add(bitmap)

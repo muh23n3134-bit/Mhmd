@@ -82,7 +82,14 @@ class ProComic : HttpSource() {
     override fun mangaDetailsParse(response: Response): SManga {
         return try {
             val data = response.parseAs<SeriesDetailResponse>()
+            val requestUrl = response.request.url.toString()
+            val parts = requestUrl.split("/")
+            val publicIdx = parts.indexOf("public")
+            val type = parts.getOrElse(publicIdx + 1) { "manga" }
+            val id = parts.getOrElse(publicIdx + 2) { "0" }
+
             SManga.create().apply {
+                url = "$type/$id/${data.slug ?: ""}"
                 title = data.title ?: ""
                 thumbnail_url = data.coverImage
                 author = data.author
@@ -103,6 +110,7 @@ class ProComic : HttpSource() {
     // =================== Chapters ===================
 
     override fun chapterListRequest(manga: SManga): Request {
+        // manga.url = type/id/slug
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
         val id = parts.getOrElse(1) { "0" }
@@ -115,20 +123,19 @@ class ProComic : HttpSource() {
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val mangaUrl = response.request.url.toString()
-        // استخراج type و seriesId و slug من الـ URL
-        // URL: /api/public/{type}/{id}/chapters
-        val urlParts = mangaUrl.split("/")
-        val typeIndex = urlParts.indexOf("public") + 1
-        val seriesType = urlParts.getOrElse(typeIndex) { "manga" }
-        val seriesId = urlParts.getOrElse(typeIndex + 1) { "0" }
+        val requestUrl = response.request.url.toString()
+        val parts = requestUrl.split("/")
+        val publicIdx = parts.indexOf("public")
+        val seriesType = parts.getOrElse(publicIdx + 1) { "manga" }
+        val seriesId = parts.getOrElse(publicIdx + 2) { "0" }
 
         val data = response.parseAs<ChaptersResponse>()
 
         return data.data.map { chapter ->
             SChapter.create().apply {
-                // نخزن: seriesType/seriesId/seriesSlug/chapterId/chapterNumber
-                url = "$seriesType/$seriesId/${chapter.seriesSlug ?: "chapter"}/${chapter.id}/${chapter.chapterNumber}"
+                // url = type/seriesId/chapterId/chapterNumber
+                // chapterNumber يُستخدم كـ chapterSlug في URL الموقع
+                url = "$seriesType/$seriesId/${chapter.id}/${chapter.chapterNumber}"
                 name = "الفصل ${chapter.chapterNumber}"
                     .plus(if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
                 date_upload = runCatching {
@@ -143,16 +150,26 @@ class ProComic : HttpSource() {
     // =================== Pages ===================
 
     override fun pageListRequest(chapter: SChapter): Request {
-        // chapter.url = seriesType/seriesId/seriesSlug/chapterId/chapterNumber
+        // chapter.url = type/seriesId/chapterId/chapterNumber
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
-        val seriesSlug = parts.getOrElse(2) { "chapter" }
-        val chapterId = parts.getOrElse(3) { "0" }
-        val chapterNum = parts.getOrElse(4) { "1" }
+        val chapterId = parts.getOrElse(2) { "0" }
+        val chapterNumber = parts.getOrElse(3) { "1" }
 
-        // نبني URL صفحة HTML للفصل
-        val htmlUrl = "$baseUrl/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterNum"
+        // نجلب slug من series details
+        val slugResponse = client.newCall(
+            GET("$baseUrl/api/public/$seriesType/$seriesId", headers),
+        ).execute()
+
+        val seriesSlug = try {
+            slugResponse.parseAs<SeriesDetailResponse>().slug ?: seriesId
+        } catch (e: Exception) {
+            seriesId
+        }
+
+        // URL الصحيح: /series/{type}/{id}/{slug}/{chapterId}/{chapterNumber}
+        val htmlUrl = "$baseUrl/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterNumber"
 
         return GET(
             htmlUrl,
@@ -167,17 +184,16 @@ class ProComic : HttpSource() {
         val html = response.body.string()
         val requestUrl = response.request.url.toString()
 
-        // استخراج chapterId من URL
-        // URL: /series/{type}/{id}/{slug}/{chapterId}/{pageNum}
+        // URL: /series/{type}/{id}/{slug}/{chapterId}/{chapterNumber}
         val urlParts = requestUrl.split("/")
+        // chapterId = عنصر قبل الأخير
         val chapterId = urlParts.getOrElse(urlParts.size - 2) { "0" }
 
-        // استخراج JWT Token من HTML
+        // استخراج JWT Token
         val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")
-        val token = jwtRegex.find(html)?.value
-            ?: return emptyList()
+        val token = jwtRegex.find(html)?.value ?: return emptyList()
 
-        // جلب الصور باستخدام التوكن
+        // جلب الصور
         val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
             .addQueryParameter("token", token)
             .addQueryParameter("split", "0")
@@ -194,18 +210,15 @@ class ProComic : HttpSource() {
         ).execute()
 
         val pagesData = pagesResponse.parseAs<ChapterDeferredResponse>()
-
         if (!pagesData.success || pagesData.data == null) return emptyList()
 
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // الصور المباشرة (الكاملة)
         pagesData.data.images.forEach { imageUrl ->
             pages.add(Page(index++, imageUrl = imageUrl))
         }
 
-        // الصور المقطعة مع إعادة الترتيب
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -246,7 +259,7 @@ class ProComic : HttpSource() {
         val coverImageApp: CoverImageApp? = null,
     ) {
         fun toSManga() = SManga.create().apply {
-            url = "$type/$id"
+            url = "$type/$id/$slug"
             title = this@SeriesDto.title
             thumbnail_url = coverImageApp?.card?.mobile
                 ?: coverImageApp?.desktop
@@ -271,6 +284,7 @@ class ProComic : HttpSource() {
     data class SeriesDetailResponse(
         val id: Int = 0,
         val title: String? = null,
+        val slug: String? = null,
         val coverImage: String? = null,
         val author: String? = null,
         val artist: String? = null,
@@ -292,7 +306,6 @@ class ProComic : HttpSource() {
         val title: String? = null,
         @SerialName("published_at") val publishedAt: String? = null,
         val lockedByCoins: Boolean? = null,
-        @SerialName("series_slug") val seriesSlug: String? = null,
     )
 
     @Serializable

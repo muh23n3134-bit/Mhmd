@@ -44,10 +44,10 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
-            if (!url.contains("#merge")) return chain.proceed(request)
+            if (!url.startsWith("merge://")) return chain.proceed(request)
 
             return try {
-                val pieceUrls = url.substringBefore("#merge").split("|")
+                val pieceUrls = url.removePrefix("merge://").split("|||")
                 val mergedBytes = downloadAndMerge(chain, request, pieceUrls)
 
                 Response.Builder()
@@ -76,10 +76,12 @@ class ProComic : HttpSource() {
             val bitmaps = mutableListOf<Bitmap>()
             try {
                 pieceUrls.forEach { pieceUrl ->
-                    val pieceRequest = originalRequest.newBuilder()
+                    // الرابط يحتوي على token مدمج فيه
+                    val pieceRequest = Request.Builder()
                         .url(pieceUrl)
                         .header("Referer", "$baseUrl/")
                         .header("Accept", "image/avif,image/webp,image/*,*/*")
+                        .header("User-Agent", originalRequest.header("User-Agent") ?: "Mozilla/5.0")
                         .build()
 
                     val response = chain.proceed(pieceRequest)
@@ -90,11 +92,14 @@ class ProComic : HttpSource() {
 
                     var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
+                    // إذا فشل AVIF جرب WebP
                     if (bitmap == null && pieceUrl.contains(".avif")) {
-                        val webpUrl = pieceUrl.substringBefore(".avif") + ".webp"
-                        val webpRequest = originalRequest.newBuilder()
+                        val webpUrl = pieceUrl.substringBefore(".avif") + ".webp" +
+                            if (pieceUrl.contains("?")) "?" + pieceUrl.substringAfter("?") else ""
+                        val webpRequest = Request.Builder()
                             .url(webpUrl)
                             .header("Referer", "$baseUrl/")
+                            .header("Accept", "image/webp,image/*,*/*")
                             .build()
                         val webpResponse = chain.proceed(webpRequest)
                         if (webpResponse.isSuccessful) {
@@ -133,8 +138,6 @@ class ProComic : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
-    // =================== Popular ===================
-
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
@@ -150,12 +153,8 @@ class ProComic : HttpSource() {
         return MangasPage(mangas, mangas.size >= 30)
     }
 
-    // =================== Latest ===================
-
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    // =================== Search ===================
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
@@ -168,8 +167,6 @@ class ProComic : HttpSource() {
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
-
-    // =================== Details ===================
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
@@ -204,8 +201,6 @@ class ProComic : HttpSource() {
         }
     }
 
-    // =================== Chapters ===================
-
     override fun chapterListRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
@@ -238,8 +233,6 @@ class ProComic : HttpSource() {
             }
         }
     }
-
-    // =================== Pages ===================
 
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
@@ -293,14 +286,14 @@ class ProComic : HttpSource() {
         // جمع كل القطع لتجنب تكرارها
         val allPieceUrls = pagesData.data.maps.flatMap { it.pieces }.toSet()
 
-        // الصور الكاملة فقط (التي ليست قطعاً مقطعة)
+        // الصور الكاملة فقط
         pagesData.data.images.forEach { imageUrl ->
             if (imageUrl !in allPieceUrls) {
                 pages.add(Page(index++, imageUrl = imageUrl))
             }
         }
 
-        // الصور المقطعة مع إعادة الترتيب والدمج
+        // الصور المقطعة - نستخدم merge:// لتجنب URL encoding
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -308,7 +301,7 @@ class ProComic : HttpSource() {
                 map.pieces
             }
             if (ordered.isNotEmpty()) {
-                pages.add(Page(index++, imageUrl = ordered.joinToString("|") + "#merge"))
+                pages.add(Page(index++, imageUrl = "merge://" + ordered.joinToString("|||")))
             }
         }
 
@@ -319,8 +312,6 @@ class ProComic : HttpSource() {
 
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())
-
-    // =================== Models ===================
 
     @Serializable
     data class LatestUpdatesResponse(

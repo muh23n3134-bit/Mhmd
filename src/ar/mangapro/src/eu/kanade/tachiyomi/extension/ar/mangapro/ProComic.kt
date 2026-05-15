@@ -17,6 +17,7 @@ import kotlinx.serialization.json.decodeFromStream
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
@@ -37,10 +38,11 @@ class ProComic : HttpSource() {
 
     companion object {
         private val mergeCache = mutableMapOf<String, List<String>>()
+        private const val MERGE_PREFIX = "https://procomic.pro/img/"
     }
 
-    override val client = network.cloudflareClient.newBuilder()
-        .addInterceptor(MergeInterceptor())
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addNetworkInterceptor(MergeInterceptor())
         .build()
 
     private inner class MergeInterceptor : Interceptor {
@@ -48,8 +50,18 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
+            if (!url.startsWith(MERGE_PREFIX)) {
+                return chain.proceed(request)
+            }
+
             val pieces = mergeCache[url]
-                ?: return chain.proceed(request)
+                ?: return Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(404)
+                    .message("Cache miss")
+                    .body("".toResponseBody(null))
+                    .build()
 
             return try {
                 val merged = mergePieces(chain, request, pieces)
@@ -64,8 +76,8 @@ class ProComic : HttpSource() {
                 Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
-                    .code(404)
-                    .message("Failed: ${e.message}")
+                    .code(500)
+                    .message("Merge error: ${e.message}")
                     .body("".toResponseBody(null))
                     .build()
             }
@@ -84,7 +96,11 @@ class ProComic : HttpSource() {
                         .url(cleanUrl)
                         .header("Referer", "$baseUrl/")
                         .header("Accept", "image/avif,image/webp,image/*,*/*")
-                        .header("User-Agent", original.header("User-Agent") ?: "Mozilla/5.0")
+                        .header(
+                            "User-Agent",
+                            original.header("User-Agent")
+                                ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        )
                         .build()
 
                     val resp = chain.proceed(req)
@@ -177,6 +193,7 @@ class ProComic : HttpSource() {
                 status = when (data.status?.lowercase()) {
                     "ongoing", "مستمر" -> SManga.ONGOING
                     "completed", "مكتمل" -> SManga.COMPLETED
+                    "hiatus" -> SManga.ON_HIATUS
                     else -> SManga.UNKNOWN
                 }
             }
@@ -273,7 +290,7 @@ class ProComic : HttpSource() {
             }
         }
 
-        // الصور المقطعة
+        // الصور المقطعة - نخزنها في cache ونعطيها رابط وهمي
         data.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -281,8 +298,7 @@ class ProComic : HttpSource() {
                 map.pieces
             }
             if (ordered.isNotEmpty()) {
-                // نستخدم رابط procomic.pro حقيقي حتى لا يفتحه WebView
-                val key = "https://procomic.pro/img/$chapterId/$index"
+                val key = "$MERGE_PREFIX$chapterId/$index"
                 mergeCache[key] = ordered
                 pages.add(Page(index++, imageUrl = key))
             }
@@ -292,13 +308,6 @@ class ProComic : HttpSource() {
     }
 
     override fun imageUrlParse(response: Response) = ""
-
-    override fun imageRequest(page: Page): Request {
-        return Request.Builder()
-            .url(page.imageUrl!!)
-            .headers(headers)
-            .build()
-    }
 
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())
@@ -355,6 +364,7 @@ class ProComic : HttpSource() {
     @Serializable
     data class ChaptersResponse(
         val data: List<ChapterDto> = emptyList(),
+        val total: Int = 0,
     )
 
     @Serializable

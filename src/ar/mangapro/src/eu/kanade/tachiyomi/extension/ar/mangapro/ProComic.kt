@@ -98,7 +98,11 @@ class ProComic : HttpSource() {
 
                     if (bitmap == null && pieceUrl.contains(".avif")) {
                         val baseUrlPart = pieceUrl.substringBefore("?")
-                        val queryPart = if (pieceUrl.contains("?")) "?" + pieceUrl.substringAfter("?") else ""
+                        val queryPart = if (pieceUrl.contains("?")) {
+                            "?" + pieceUrl.substringAfter("?")
+                        } else {
+                            ""
+                        }
                         val webpUrl = baseUrlPart.replace(".avif", ".webp") + queryPart
 
                         val webpRequest = Request.Builder()
@@ -290,12 +294,15 @@ class ProComic : HttpSource() {
 
         val allPieceUrls = pagesData.data.maps.flatMap { it.pieces }.toSet()
 
+        // الصور الكاملة
         pagesData.data.images.forEach { imageUrl ->
             if (imageUrl !in allPieceUrls) {
                 pages.add(Page(index++, imageUrl = imageUrl))
             }
         }
 
+        // الصور المقطعة - نضع المعلومات في url وليس imageUrl
+        // حتى يمر عبر imageUrlRequest ثم الـ Interceptor
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -303,16 +310,28 @@ class ProComic : HttpSource() {
                 map.pieces
             }
             if (ordered.isNotEmpty()) {
-                // استخدام https://merge.local/ كـ prefix صالح لـ OkHttp
                 val mergeUrl = "https://merge.local/" + ordered.joinToString("|||")
-                pages.add(Page(index++, imageUrl = mergeUrl))
+                pages.add(Page(index++, url = mergeUrl, imageUrl = mergeUrl))
             }
         }
 
         return pages
     }
 
-    override fun imageUrlParse(response: Response) = ""
+    // هذا هو المفتاح - عندما Mihon يطلب imageUrl للصفحة
+    // نعيد نفس الـ URL حتى يمر عبر الـ Interceptor
+    override fun imageUrlParse(response: Response): String {
+        return response.request.url.toString()
+    }
+
+    // تعديل imageRequest حتى يمر عبر الـ Interceptor بشكل صحيح
+    override fun imageRequest(page: Page): Request {
+        val imageUrl = page.imageUrl ?: page.url
+        return Request.Builder()
+            .url(imageUrl)
+            .headers(headers)
+            .build()
+    }
 
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())

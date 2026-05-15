@@ -92,8 +92,21 @@ class ProComic : HttpSource() {
                     val bytes = response.body.bytes()
                     response.close()
 
+                    // محاولة فك تشفير الصورة (AVIF قد يفشل هنا)
                     val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        ?: throw Exception("فشل فك تشفير الصورة")
+                        ?: run {
+                            // إذا فشل فك التشفير، جرب طلب نسخة WebP من الرابط
+                            val webpUrl = pieceUrl.replace(".avif", ".webp")
+                            val webpRequest = originalRequest.newBuilder()
+                                .url(webpUrl)
+                                .header("Referer", "$baseUrl/")
+                                .build()
+                            val webpResponse = chain.proceed(webpRequest)
+                            val webpBytes = webpResponse.body.bytes()
+                            webpResponse.close()
+                            BitmapFactory.decodeByteArray(webpBytes, 0, webpBytes.size)
+                                ?: throw Exception("فشل تحميل الصورة حتى بتنسيق WebP")
+                        }
 
                     bitmaps.add(bitmap)
                 }
@@ -124,6 +137,7 @@ class ProComic : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
+    // =================== Popular & Latest & Search ===================
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
@@ -154,6 +168,7 @@ class ProComic : HttpSource() {
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
+    // =================== Details & Chapters ===================
     override fun mangaDetailsRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
@@ -220,6 +235,7 @@ class ProComic : HttpSource() {
         }
     }
 
+    // =================== Pages ===================
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
@@ -267,10 +283,7 @@ class ProComic : HttpSource() {
         val pages = mutableListOf<Page>()
         var index = 0
 
-        pagesData.data.images.forEach { imageUrl ->
-            pages.add(Page(index++, imageUrl = imageUrl))
-        }
-
+        // التعديل: نضع الخرائط (maps) أولاً لأنها تمثل الصفحات المدمجة الصحيحة
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -282,6 +295,13 @@ class ProComic : HttpSource() {
             }
         }
 
+        // التعديل: إذا لم توجد خرائط، نستخدم الصور العادية (images)
+        if (pages.isEmpty()) {
+            pagesData.data.images.forEach { imageUrl ->
+                pages.add(Page(index++, imageUrl = imageUrl))
+            }
+        }
+
         return pages
     }
 
@@ -290,11 +310,9 @@ class ProComic : HttpSource() {
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())
 
+    // =================== Models ===================
     @Serializable
-    data class LatestUpdatesResponse(
-        val success: Boolean = false,
-        val data: List<SeriesDto> = emptyList(),
-    )
+    data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
 
     @Serializable
     data class SeriesDto(
@@ -308,23 +326,12 @@ class ProComic : HttpSource() {
         fun toSManga() = SManga.create().apply {
             url = "$type/$id/$slug"
             title = this@SeriesDto.title
-            thumbnail_url = coverImageApp?.card?.mobile
-                ?: coverImageApp?.desktop
-                ?: coverImage
+            thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage
         }
     }
 
-    @Serializable
-    data class CoverImageApp(
-        val desktop: String? = null,
-        val card: CardImages? = null,
-    )
-
-    @Serializable
-    data class CardImages(
-        val mobile: String? = null,
-        val desktop: String? = null,
-    )
+    @Serializable data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
+    @Serializable data class CardImages(val mobile: String? = null, val desktop: String? = null)
 
     @Serializable
     data class SeriesDetailResponse(
@@ -339,10 +346,7 @@ class ProComic : HttpSource() {
         val status: String? = null,
     )
 
-    @Serializable
-    data class ChaptersResponse(
-        val data: List<ChapterDto> = emptyList(),
-    )
+    @Serializable data class ChaptersResponse(val data: List<ChapterDto> = emptyList())
 
     @Serializable
     data class ChapterDto(
@@ -353,11 +357,7 @@ class ProComic : HttpSource() {
         val lockedByCoins: Boolean? = null,
     )
 
-    @Serializable
-    data class ChapterDeferredResponse(
-        val success: Boolean = false,
-        val data: ChapterDeferredData? = null,
-    )
+    @Serializable data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)
 
     @Serializable
     data class ChapterDeferredData(
@@ -366,9 +366,5 @@ class ProComic : HttpSource() {
         val maps: List<PageMap> = emptyList(),
     )
 
-    @Serializable
-    data class PageMap(
-        val pieces: List<String> = emptyList(),
-        val order: List<Int> = emptyList(),
-    )
+    @Serializable data class PageMap(val pieces: List<String> = emptyList(), val order: List<Int> = emptyList())
 }

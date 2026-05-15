@@ -47,7 +47,7 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
-            // نتحقق إذا كان الرابط مخزن في الـ cache
+            // نتحقق إذا كان الرابط مخزن في الـ cache (وهو الرابط الوهمي)
             val pieceUrls = mergeCache[url]
             if (pieceUrls == null) return chain.proceed(request)
 
@@ -61,6 +61,7 @@ class ProComic : HttpSource() {
                     .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
                     .build()
             } catch (e: Exception) {
+                // إرجاع خطأ لكي يعرف التطبيق أن هناك مشكلة بدلاً من إظهار صورة فارغة
                 Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
@@ -91,22 +92,25 @@ class ProComic : HttpSource() {
                         .build()
 
                     val response = chain.proceed(pieceRequest)
-                    if (!response.isSuccessful) throw Exception("HTTP ${response.code}")
+                    if (!response.isSuccessful) throw Exception("HTTP ${response.code} for URL: $pieceUrl")
 
                     val bytes = response.body.bytes()
                     response.close()
 
                     var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
+                    // محاولة الاسترجاع إذا كان التنسيق AVIF ولم يدعمه النظام
                     if (bitmap == null && pieceUrl.contains(".avif")) {
                         val baseUrlPart = pieceUrl.substringBefore("?")
                         val queryPart = if (pieceUrl.contains("?")) "?" + pieceUrl.substringAfter("?") else ""
                         val webpUrl = baseUrlPart.replace(".avif", ".webp") + queryPart
+                        
                         val webpRequest = Request.Builder()
                             .url(webpUrl)
                             .header("Referer", "$baseUrl/")
                             .header("Accept", "image/webp,image/*,*/*")
                             .build()
+                            
                         val webpResponse = chain.proceed(webpRequest)
                         if (webpResponse.isSuccessful) {
                             val webpBytes = webpResponse.body.bytes()
@@ -117,9 +121,10 @@ class ProComic : HttpSource() {
                         }
                     }
 
-                    bitmaps.add(bitmap ?: throw Exception("فشل فك تشفير الصورة"))
+                    bitmaps.add(bitmap ?: throw Exception("فشل فك تشفير الصورة. قد يكون التنسيق غير مدعوم."))
                 }
 
+                // دمج الصور
                 val maxWidth = bitmaps.maxOf { it.width }
                 val totalHeight = bitmaps.sumOf { it.height }
                 val merged = Bitmap.createBitmap(maxWidth, totalHeight, Bitmap.Config.ARGB_8888)
@@ -136,6 +141,7 @@ class ProComic : HttpSource() {
                 merged.recycle()
                 return output.toByteArray()
             } finally {
+                // تحرير الذاكرة لتجنب مشكلة OutOfMemory
                 bitmaps.forEach { it.recycle() }
             }
         }
@@ -271,9 +277,7 @@ class ProComic : HttpSource() {
         val urlParts = response.request.url.toString().split("/")
         val chapterId = urlParts.getOrElse(urlParts.size - 2) { "0" }
 
-        val jwtRegex = Regex(
-            """eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""",
-        )
+        val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")
         val token = jwtRegex.find(html)?.value ?: return emptyList()
 
         val pagesResponse = client.newCall(
@@ -289,22 +293,37 @@ class ProComic : HttpSource() {
         val pages = mutableListOf<Page>()
         var index = 0
 
-        val allPieceUrls = pagesData.data.maps.flatMap { it.pieces }.toSet()
+        // 🟢 الدالة المسؤولة عن تنظيف الروابط من أكواد HTML مثل &amp;
+        fun cleanUrl(url: String): String {
+            return url.replace("&amp;", "&")
+        }
 
+        // تنظيف جميع الروابط الموجودة في الخرائط (maps)
+        val allPieceUrls = pagesData.data.maps.flatMap { map ->
+            map.pieces.map { cleanUrl(it) }
+        }.toSet()
+
+        // إضافة الصور العادية (غير المقطوعة) بعد تنظيف روابطها
         pagesData.data.images.forEach { imageUrl ->
-            if (imageUrl !in allPieceUrls) {
-                pages.add(Page(index++, imageUrl = imageUrl))
+            val cleanedImageUrl = cleanUrl(imageUrl)
+            if (cleanedImageUrl !in allPieceUrls) {
+                pages.add(Page(index++, imageUrl = cleanedImageUrl))
             }
         }
 
+        // معالجة الصور المقطوعة
         pagesData.data.maps.forEach { map ->
+            // تنظيف روابط القطع أولاً
+            val cleanedPieces = map.pieces.map { cleanUrl(it) }
+            
             val ordered = if (map.order.isNotEmpty()) {
-                map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
+                map.order.mapNotNull { i -> cleanedPieces.getOrNull(i) }
             } else {
-                map.pieces
+                cleanedPieces
             }
+
             if (ordered.isNotEmpty()) {
-                // نخزن القطع في الـ cache مع key فريد
+                // نخزن القطع النظيفة في الـ cache مع key فريد
                 val cacheKey = "https://procomic.pro/merge/$chapterId/$index"
                 mergeCache[cacheKey] = ordered
                 pages.add(Page(index++, imageUrl = cacheKey))

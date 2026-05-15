@@ -44,10 +44,11 @@ class ProComic : HttpSource() {
             val request = chain.request()
             val url = request.url.toString()
 
-            if (!url.startsWith("merge://")) return chain.proceed(request)
+            if (!url.startsWith("https://merge.local/")) return chain.proceed(request)
 
             return try {
-                val pieceUrls = url.removePrefix("merge://").split("|||")
+                val encoded = url.removePrefix("https://merge.local/")
+                val pieceUrls = encoded.split("|||")
                 val mergedBytes = downloadAndMerge(chain, request, pieceUrls)
 
                 Response.Builder()
@@ -76,12 +77,15 @@ class ProComic : HttpSource() {
             val bitmaps = mutableListOf<Bitmap>()
             try {
                 pieceUrls.forEach { pieceUrl ->
-                    // الرابط يحتوي على token مدمج فيه
                     val pieceRequest = Request.Builder()
                         .url(pieceUrl)
                         .header("Referer", "$baseUrl/")
                         .header("Accept", "image/avif,image/webp,image/*,*/*")
-                        .header("User-Agent", originalRequest.header("User-Agent") ?: "Mozilla/5.0")
+                        .header(
+                            "User-Agent",
+                            originalRequest.header("User-Agent")
+                                ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        )
                         .build()
 
                     val response = chain.proceed(pieceRequest)
@@ -92,10 +96,11 @@ class ProComic : HttpSource() {
 
                     var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
-                    // إذا فشل AVIF جرب WebP
                     if (bitmap == null && pieceUrl.contains(".avif")) {
-                        val webpUrl = pieceUrl.substringBefore(".avif") + ".webp" +
-                            if (pieceUrl.contains("?")) "?" + pieceUrl.substringAfter("?") else ""
+                        val baseUrlPart = pieceUrl.substringBefore("?")
+                        val queryPart = if (pieceUrl.contains("?")) "?" + pieceUrl.substringAfter("?") else ""
+                        val webpUrl = baseUrlPart.replace(".avif", ".webp") + queryPart
+
                         val webpRequest = Request.Builder()
                             .url(webpUrl)
                             .header("Referer", "$baseUrl/")
@@ -283,17 +288,14 @@ class ProComic : HttpSource() {
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // جمع كل القطع لتجنب تكرارها
         val allPieceUrls = pagesData.data.maps.flatMap { it.pieces }.toSet()
 
-        // الصور الكاملة فقط
         pagesData.data.images.forEach { imageUrl ->
             if (imageUrl !in allPieceUrls) {
                 pages.add(Page(index++, imageUrl = imageUrl))
             }
         }
 
-        // الصور المقطعة - نستخدم merge:// لتجنب URL encoding
         pagesData.data.maps.forEach { map ->
             val ordered = if (map.order.isNotEmpty()) {
                 map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
@@ -301,7 +303,9 @@ class ProComic : HttpSource() {
                 map.pieces
             }
             if (ordered.isNotEmpty()) {
-                pages.add(Page(index++, imageUrl = "merge://" + ordered.joinToString("|||")))
+                // استخدام https://merge.local/ كـ prefix صالح لـ OkHttp
+                val mergeUrl = "https://merge.local/" + ordered.joinToString("|||")
+                pages.add(Page(index++, imageUrl = mergeUrl))
             }
         }
 

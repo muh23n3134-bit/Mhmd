@@ -35,38 +35,55 @@ class ProComic : HttpSource() {
     private val json = Json { ignoreUnknownKeys = true }
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    // نخزن القطع هنا مؤقتاً
-    private val mergeCache = mutableMapOf<String, List<String>>()
+    // مخزن مؤقت لقطع الصور المدمجة
+    [span_2](start_span)private val mergeCache = mutableMapOf<String, List<String>>()[span_2](end_span)
 
+    // إعداد العميل مع المحاكي والمعترض الخاص بالدمج
     override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor(BrowserSimulatorInterceptor()) // المحاكي الجديد
         .addInterceptor(ImageMergeInterceptor())
         .build()
+
+    /**
+     * محاكي المتصفح: يضمن أن جميع الطلبات تخرج برؤوس (Headers) مطابقة للمتصفح الحقيقي
+     */
+    private inner class BrowserSimulatorInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val originalRequest = chain.request()
+            val requestBuilder = originalRequest.newBuilder()
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                .header("Accept-Language", "ar,en-US;q=0.9,en;q=0.8")
+                .header("Referer", "$baseUrl/")
+                .header("Cache-Control", "no-cache")
+
+            return chain.proceed(requestBuilder.build())
+        }
+    }
 
     private inner class ImageMergeInterceptor : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val request = chain.request()
             val url = request.url.toString()
 
-            // نتحقق إذا كان الرابط مخزن في الـ cache (وهو الرابط الوهمي)
-            val pieceUrls = mergeCache[url]
+            [span_3](start_span)val pieceUrls = mergeCache[url][span_3](end_span)
             if (pieceUrls == null) return chain.proceed(request)
 
             return try {
                 val mergedBytes = downloadAndMerge(chain, request, pieceUrls)
                 Response.Builder()
-                    .request(request)
+                    [span_4](start_span).request(request)[span_4](end_span)
                     .protocol(Protocol.HTTP_1_1)
                     .code(200)
                     .message("OK")
                     .body(mergedBytes.toResponseBody("image/jpeg".toMediaType()))
-                    .build()
+                    [span_5](start_span).build()[span_5](end_span)
             } catch (e: Exception) {
-                // إرجاع خطأ لكي يعرف التطبيق أن هناك مشكلة بدلاً من إظهار صورة فارغة
                 Response.Builder()
                     .request(request)
                     .protocol(Protocol.HTTP_1_1)
                     .code(404)
-                    .message("Merge failed: ${e.message}")
+                    [span_6](start_span).message("Merge failed: ${e.message}")[span_6](end_span)
                     .body("".toResponseBody(null))
                     .build()
             }
@@ -74,88 +91,59 @@ class ProComic : HttpSource() {
 
         private fun downloadAndMerge(
             chain: Interceptor.Chain,
-            originalRequest: Request,
+            [span_7](start_span)originalRequest: Request,[span_7](end_span)
             pieceUrls: List<String>,
         ): ByteArray {
             val bitmaps = mutableListOf<Bitmap>()
             try {
                 pieceUrls.forEach { pieceUrl ->
-                    val pieceRequest = Request.Builder()
-                        .url(pieceUrl)
-                        .header("Referer", "$baseUrl/")
-                        .header("Accept", "image/avif,image/webp,image/*,*/*")
-                        .header(
-                            "User-Agent",
-                            originalRequest.header("User-Agent")
-                                ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        )
+                    // تنظيف الرابط من &amp; لضمان عدم فشل التوكن
+                    val cleanUrl = pieceUrl.replace("&amp;", "&")
+                    
+                    [span_8](start_span)val pieceRequest = Request.Builder()[span_8](end_span)
+                        .url(cleanUrl)
+                        .headers(originalRequest.headers)
                         .build()
 
                     val response = chain.proceed(pieceRequest)
-                    if (!response.isSuccessful) throw Exception("HTTP ${response.code} for URL: $pieceUrl")
+                    if (!response.isSuccessful) throw Exception("HTTP ${response.code}")
 
-                    val bytes = response.body.bytes()
+                    [span_9](start_span)val bytes = response.body.bytes()[span_9](end_span)
                     response.close()
 
-                    var bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-
-                    // محاولة الاسترجاع إذا كان التنسيق AVIF ولم يدعمه النظام
-                    if (bitmap == null && pieceUrl.contains(".avif")) {
-                        val baseUrlPart = pieceUrl.substringBefore("?")
-                        val queryPart = if (pieceUrl.contains("?")) "?" + pieceUrl.substringAfter("?") else ""
-                        val webpUrl = baseUrlPart.replace(".avif", ".webp") + queryPart
-                        
-                        val webpRequest = Request.Builder()
-                            .url(webpUrl)
-                            .header("Referer", "$baseUrl/")
-                            .header("Accept", "image/webp,image/*,*/*")
-                            .build()
-                            
-                        val webpResponse = chain.proceed(webpRequest)
-                        if (webpResponse.isSuccessful) {
-                            val webpBytes = webpResponse.body.bytes()
-                            webpResponse.close()
-                            bitmap = BitmapFactory.decodeByteArray(webpBytes, 0, webpBytes.size)
-                        } else {
-                            webpResponse.close()
-                        }
-                    }
-
-                    bitmaps.add(bitmap ?: throw Exception("فشل فك تشفير الصورة. قد يكون التنسيق غير مدعوم."))
+                    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    [span_10](start_span)bitmaps.add(bitmap ?: throw Exception("فشل فك تشفير الصورة"))[span_10](end_span)
                 }
 
-                // دمج الصور
                 val maxWidth = bitmaps.maxOf { it.width }
                 val totalHeight = bitmaps.sumOf { it.height }
                 val merged = Bitmap.createBitmap(maxWidth, totalHeight, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(merged)
-                var currentY = 0f
+                [span_11](start_span)var currentY = 0f[span_11](end_span)
 
                 bitmaps.forEach { bitmap ->
                     canvas.drawBitmap(bitmap, 0f, currentY, null)
                     currentY += bitmap.height
                 }
 
-                val output = ByteArrayOutputStream()
-                merged.compress(Bitmap.CompressFormat.JPEG, 85, output)
+                [span_12](start_span)val output = ByteArrayOutputStream()[span_12](end_span)
+                merged.compress(Bitmap.CompressFormat.JPEG, 90, output)
                 merged.recycle()
                 return output.toByteArray()
             } finally {
-                // تحرير الذاكرة لتجنب مشكلة OutOfMemory
-                bitmaps.forEach { it.recycle() }
+                [span_13](start_span)bitmaps.forEach { it.recycle() }[span_13](end_span)
             }
         }
     }
 
-    override fun headersBuilder() = super.headersBuilder()
-        .add("Referer", "$baseUrl/")
+    // --- بقية الدوال الأساسية للمصدر ---
 
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
             .addQueryParameter("category", "comics")
             .addQueryParameter("page", page.toString())
-            .build()
+            [span_14](start_span).build()[span_14](end_span)
         return GET(url, headers)
     }
 
@@ -178,7 +166,7 @@ class ProComic : HttpSource() {
         return GET(url, headers)
     }
 
-    override fun searchMangaParse(response: Response) = popularMangaParse(response)
+    [span_15](start_span)override fun searchMangaParse(response: Response) = popularMangaParse(response)[span_15](end_span)
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
@@ -188,35 +176,29 @@ class ProComic : HttpSource() {
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        return try {
-            val data = response.parseAs<SeriesDetailResponse>()
-            val parts = response.request.url.toString().split("/")
-            val publicIdx = parts.indexOf("public")
-            val type = parts.getOrElse(publicIdx + 1) { "manga" }
-            val id = parts.getOrElse(publicIdx + 2) { "0" }
+        [span_16](start_span)val data = response.parseAs<SeriesDetailResponse>()[span_16](end_span)
+        val parts = response.request.url.toString().split("/")
+        val publicIdx = parts.indexOf("public")
+        val type = parts.getOrElse(publicIdx + 1) { "manga" }
+        val id = parts.getOrElse(publicIdx + 2) { "0" }
 
-            SManga.create().apply {
-                url = "$type/$id/${data.slug ?: ""}"
-                title = data.title ?: ""
-                thumbnail_url = data.coverImage
-                author = data.author
-                artist = data.artist
-                description = data.synopsis ?: data.description
-                status = when (data.status?.lowercase()) {
-                    "ongoing", "مستمر" -> SManga.ONGOING
-                    "completed", "مكتمل" -> SManga.COMPLETED
-                    else -> SManga.UNKNOWN
-                }
-            }
-        } catch (e: Exception) {
-            SManga.create()
+        return SManga.create().apply {
+            [span_17](start_span)url = "$type/$id/${data.slug ?: ""}"[span_17](end_span)
+            title = data.title ?: ""
+            thumbnail_url = data.coverImage
+            [span_18](start_span)description = data.synopsis ?: data.description[span_18](end_span)
+            status = when (data.status?.lowercase()) {
+                "ongoing", "مستمر" -> SManga.ONGOING
+                "completed", "مكتمل" -> SManga.COMPLETED
+                else -> SManga.UNKNOWN
+            [span_19](start_span)}
         }
     }
 
     override fun chapterListRequest(manga: SManga): Request {
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
-        val id = parts.getOrElse(1) { "0" }
+        val id = parts.getOrElse(1) { "0" }[span_19](end_span)
         val url = "$baseUrl/api/public/$type/$id/chapters".toHttpUrl().newBuilder()
             .addQueryParameter("page", "1")
             .addQueryParameter("limit", "500")
@@ -227,7 +209,7 @@ class ProComic : HttpSource() {
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val parts = response.request.url.toString().split("/")
-        val publicIdx = parts.indexOf("public")
+        [span_20](start_span)val publicIdx = parts.indexOf("public")[span_20](end_span)
         val seriesType = parts.getOrElse(publicIdx + 1) { "manga" }
         val seriesId = parts.getOrElse(publicIdx + 2) { "0" }
 
@@ -235,41 +217,25 @@ class ProComic : HttpSource() {
         return data.data.map { chapter ->
             SChapter.create().apply {
                 url = "$seriesType/$seriesId/${chapter.id}/${chapter.chapterNumber}"
-                name = "الفصل ${chapter.chapterNumber}" +
-                    (if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
-                date_upload = runCatching {
-                    dateFormat.parse(chapter.publishedAt ?: "")?.time
-                }.getOrNull() ?: 0L
-                chapter_number = chapter.chapterNumber.toFloatOrNull() ?: 0f
-                scanlator = if (chapter.lockedByCoins == true) "🔒 مدفوع" else null
+                [span_21](start_span)name = "الفصل ${chapter.chapterNumber}" + (if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")[span_21](end_span)
+                date_upload = runCatching { dateFormat.parse(chapter.publishedAt ?: "")?.time }.getOrNull() ?: 0L
+                [span_22](start_span)chapter_number = chapter.chapterNumber.toFloatOrNull() ?: 0f[span_22](end_span)
             }
         }
     }
 
     override fun pageListRequest(chapter: SChapter): Request {
         val parts = chapter.url.split("/")
-        val seriesType = parts.getOrElse(0) { "manga" }
+        [span_23](start_span)val seriesType = parts.getOrElse(0) { "manga" }[span_23](end_span)
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
         val chapterNumber = parts.getOrElse(3) { "1" }
 
-        val slugResponse = client.newCall(
-            GET("$baseUrl/api/public/$seriesType/$seriesId", headers),
-        ).execute()
-        val seriesSlug = try {
-            slugResponse.parseAs<SeriesDetailResponse>().slug ?: seriesId
-        } catch (e: Exception) {
-            seriesId
-        }
+        val slugResponse = client.newCall(GET("$baseUrl/api/public/$seriesType/$seriesId", headers)).execute()
+        [span_24](start_span)val seriesSlug = try { slugResponse.parseAs<SeriesDetailResponse>().slug ?: seriesId } catch (e: Exception) { seriesId }[span_24](end_span)
 
         val htmlUrl = "$baseUrl/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterNumber"
-        return GET(
-            htmlUrl,
-            headers.newBuilder()
-                .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .set("Referer", "$baseUrl/series/$seriesType/$seriesId/$seriesSlug")
-                .build(),
-        )
+        return GET(htmlUrl, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
@@ -277,57 +243,42 @@ class ProComic : HttpSource() {
         val urlParts = response.request.url.toString().split("/")
         val chapterId = urlParts.getOrElse(urlParts.size - 2) { "0" }
 
-        val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")
+        [span_25](start_span)val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")[span_25](end_span)
         val token = jwtRegex.find(html)?.value ?: return emptyList()
 
         val pagesResponse = client.newCall(
-            GET(
-                "$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0",
-                headers.newBuilder().set("Accept", "application/json").build(),
-            ),
-        ).execute()
+            GET("$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0", headers)
+        [span_26](start_span)).execute()[span_26](end_span)
 
         val pagesData = pagesResponse.parseAs<ChapterDeferredResponse>()
-        if (!pagesData.success || pagesData.data == null) return emptyList()
+        [span_27](start_span)if (!pagesData.success || pagesData.data == null) return emptyList()[span_27](end_span)
 
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // 🟢 الدالة المسؤولة عن تنظيف الروابط من أكواد HTML مثل &amp;
-        fun cleanUrl(url: String): String {
-            return url.replace("&amp;", "&")
-        }
+        // تنظيف وحصر روابط القطع
+        val allPieceUrls = pagesData.data.maps.flatMap { it.pieces }.map { it.replace("&amp;", "&") }.toSet()
 
-        // تنظيف جميع الروابط الموجودة في الخرائط (maps)
-        val allPieceUrls = pagesData.data.maps.flatMap { map ->
-            map.pieces.map { cleanUrl(it) }
-        }.toSet()
-
-        // إضافة الصور العادية (غير المقطوعة) بعد تنظيف روابطها
         pagesData.data.images.forEach { imageUrl ->
-            val cleanedImageUrl = cleanUrl(imageUrl)
-            if (cleanedImageUrl !in allPieceUrls) {
-                pages.add(Page(index++, imageUrl = cleanedImageUrl))
+            val cleanImgUrl = imageUrl.replace("&amp;", "&")
+            if (cleanImgUrl !in allPieceUrls) {
+                pages.add(Page(index++, imageUrl = cleanImgUrl))
             }
-        }
+        [span_28](start_span)}
 
-        // معالجة الصور المقطوعة
         pagesData.data.maps.forEach { map ->
-            // تنظيف روابط القطع أولاً
-            val cleanedPieces = map.pieces.map { cleanUrl(it) }
-            
+            val cleanPieces = map.pieces.map { it.replace("&amp;", "&") }
             val ordered = if (map.order.isNotEmpty()) {
-                map.order.mapNotNull { i -> cleanedPieces.getOrNull(i) }
+                map.order.mapNotNull { i -> cleanPieces.getOrNull(i) }
             } else {
-                cleanedPieces
+                cleanPieces
             }
 
             if (ordered.isNotEmpty()) {
-                // نخزن القطع النظيفة في الـ cache مع key فريد
-                val cacheKey = "https://procomic.pro/merge/$chapterId/$index"
+                val cacheKey = "https://procomic.pro/merge/$chapterId/$index"[span_28](end_span)
                 mergeCache[cacheKey] = ordered
                 pages.add(Page(index++, imageUrl = cacheKey))
-            }
+            [span_29](start_span)}
         }
 
         return pages
@@ -336,95 +287,33 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response) = ""
 
     override fun imageRequest(page: Page): Request {
-        val imageUrl = page.imageUrl!!
-        return Request.Builder()
-            .url(imageUrl)
-            .headers(headers)
-            .build()
+        return Request.Builder().url(page.imageUrl!!).headers(headers).build()[span_29](end_span)
     }
 
-    private inline fun <reified T> Response.parseAs(): T =
-        json.decodeFromStream(body.byteStream())
+    private inline fun <reified T> Response.parseAs(): T = json.decodeFromStream(body.byteStream())
 
-    @Serializable
-    data class LatestUpdatesResponse(
-        val success: Boolean = false,
-        val data: List<SeriesDto> = emptyList(),
-    )
-
-    @Serializable
-    data class SeriesDto(
+    // --- النماذج البرمجية (Data Classes) ---
+    @Serializable data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
+    @Serializable data class SeriesDto(
         @SerialName("mangaId") val id: Int = 0,
         @SerialName("mangaSlug") val slug: String = "",
         @SerialName("mangaTitle") val title: String = "",
         val coverImage: String? = null,
         val type: String = "manga",
-        val coverImageApp: CoverImageApp? = null,
+        val coverImageApp: CoverImageApp? = null
     ) {
         fun toSManga() = SManga.create().apply {
             url = "$type/$id/$slug"
             title = this@SeriesDto.title
-            thumbnail_url = coverImageApp?.card?.mobile
-                ?: coverImageApp?.desktop
-                ?: coverImage
+            thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage
         }
     }
-
-    @Serializable
-    data class CoverImageApp(
-        val desktop: String? = null,
-        val card: CardImages? = null,
-    )
-
-    @Serializable
-    data class CardImages(
-        val mobile: String? = null,
-        val desktop: String? = null,
-    )
-
-    @Serializable
-    data class SeriesDetailResponse(
-        val id: Int = 0,
-        val title: String? = null,
-        val slug: String? = null,
-        val coverImage: String? = null,
-        val author: String? = null,
-        val artist: String? = null,
-        val description: String? = null,
-        val synopsis: String? = null,
-        val status: String? = null,
-    )
-
-    @Serializable
-    data class ChaptersResponse(
-        val data: List<ChapterDto> = emptyList(),
-    )
-
-    @Serializable
-    data class ChapterDto(
-        val id: Int = 0,
-        @SerialName("chapter_number") val chapterNumber: String = "0",
-        val title: String? = null,
-        @SerialName("published_at") val publishedAt: String? = null,
-        val lockedByCoins: Boolean? = null,
-    )
-
-    @Serializable
-    data class ChapterDeferredResponse(
-        val success: Boolean = false,
-        val data: ChapterDeferredData? = null,
-    )
-
-    @Serializable
-    data class ChapterDeferredData(
-        val chapterId: Int = 0,
-        val images: List<String> = emptyList(),
-        val maps: List<PageMap> = emptyList(),
-    )
-
-    @Serializable
-    data class PageMap(
-        val pieces: List<String> = emptyList(),
-        val order: List<Int> = emptyList(),
-    )
+    [span_30](start_span)@Serializable data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)[span_30](end_span)
+    @Serializable data class CardImages(val mobile: String? = null, val desktop: String? = null)
+    @Serializable data class SeriesDetailResponse(val id: Int = 0, val title: String? = null, val slug: String? = null, val coverImage: String? = null, val synopsis: String? = null, val description: String? = null, val status: String? = null)
+    @Serializable data class ChaptersResponse(val data: List<ChapterDto> = emptyList())
+    @Serializable data class ChapterDto(val id: Int = 0, @SerialName("chapter_number") val chapterNumber: String = "0", val title: String? = null, @SerialName("published_at") val publishedAt: String? = null)
+    [span_31](start_span)@Serializable data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)[span_31](end_span)
+    @Serializable data class ChapterDeferredData(val chapterId: Int = 0, val images: List<String> = emptyList(), val maps: List<PageMap> = emptyList())
+    @Serializable data class PageMap(val pieces: List<String> = emptyList(), val order: List<Int> = emptyList())
 }

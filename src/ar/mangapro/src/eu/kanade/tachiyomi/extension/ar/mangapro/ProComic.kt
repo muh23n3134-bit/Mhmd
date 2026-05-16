@@ -222,33 +222,29 @@ class ProComic : HttpSource() {
 
         val allPieceUrls = data.data.maps.flatMap { it.pieces }.toSet()
 
-        // الصفحات العادية غير المقطعة
         data.data.images.forEach { url ->
             if (url !in allPieceUrls) {
                 pages.add(Page(index++, imageUrl = url))
             }
         }
 
-        // الصفحات المقطعة — صفحة واحدة لكل صف في الشبكة
-        // مثال: grid_5x8 (5 أعمدة × 8 صفوف) → 8 صفحات منفصلة
-        // يدعم أي عدد أعمدة (2، 3، 4، 5، 6، أو أكثر)
         data.data.maps.forEach { map ->
             if (map.pieces.isEmpty()) return@forEach
-
             val (cols, rows) = parseMode(map.mode, map.pieces.size)
-            val total = cols * rows
 
-            // حلّ order مسبقاً: orderedPieces[destPos] = رابط القطعة الصحيحة
-            // order[srcIdx] = destPos: القطعة رقم srcIdx تذهب إلى الموضع destPos
+            // ✅ التفسير الصحيح: order[destPos] = srcIdx
+            // الموضع destPos يعرض القطعة رقم order[destPos]
+            // مثال: order=[2,0,1] → الموضع 0 = pieces[2]، الموضع 1 = pieces[0]، الموضع 2 = pieces[1]
+            val total = cols * rows
             val orderedPieces = Array(total) { "" }
-            for (srcIdx in map.pieces.indices) {
-                val destPos = map.order.getOrElse(srcIdx) { srcIdx }
-                if (destPos in 0 until total) {
+            for (destPos in 0 until total) {
+                val srcIdx = map.order.getOrElse(destPos) { destPos }
+                if (srcIdx in map.pieces.indices) {
                     orderedPieces[destPos] = map.pieces[srcIdx]
                 }
             }
 
-            // أنشئ صفحة واحدة لكل صف — كل صفحة = (cols) قطعة جنباً إلى جنب
+            // صفحة واحدة لكل صف — يدعم أي عدد أعمدة (2، 3، 4، 5، 6، أو أكثر)
             for (rowIdx in 0 until rows) {
                 val rowPieces = (0 until cols).mapNotNull { col ->
                     orderedPieces.getOrElse(rowIdx * cols + col) { "" }
@@ -270,10 +266,9 @@ class ProComic : HttpSource() {
 
     override fun imageUrlParse(response: Response) = ""
 
-    // يدمج قطع صف واحد أفقياً — القطع مرتبة مسبقاً، لا يوجد إعادة ترتيب هنا
-    // يدعم أي عدد قطع في الصف (cols) بغض النظر عن القيمة
+    // يدمج قطع الصف الواحد أفقياً — القطع مرتبة مسبقاً
     private fun mergeStrip(strip: PageStrip): ByteArray? {
-        // قطعة واحدة فقط: أعدها مباشرة بدون Canvas لتوفير الذاكرة
+        // قطعة واحدة: أعدها مباشرة بدون Canvas
         if (strip.pieces.size == 1) {
             return runCatching {
                 val req = Request.Builder()
@@ -291,8 +286,6 @@ class ProComic : HttpSource() {
 
         val bitmaps = mutableListOf<Bitmap?>()
         return try {
-            // حمّل كل قطعة في الصف بالترتيب
-            // pieces[0] = أقصى اليسار، pieces[cols-1] = أقصى اليمين
             for (pieceUrl in strip.pieces) {
                 val req = Request.Builder()
                     .url(pieceUrl)
@@ -309,9 +302,6 @@ class ProComic : HttpSource() {
             val valid = bitmaps.filterNotNull()
             if (valid.isEmpty()) return null
 
-            // ارسم القطع أفقياً جنباً إلى جنب
-            // يدعم أي عدد قطع: 2، 3، 4، 5، 6، أو أكثر
-            val pieceW = valid.first().width
             val pieceH = valid.maxOf { it.height }
             val totalW = valid.sumOf { it.width }
 
@@ -339,7 +329,6 @@ class ProComic : HttpSource() {
     }
 
     // يفكك صيغة الـ mode ويعيد (cols, rows)
-    // يدعم أي قيمة: grid_2x5، grid_4x3، grid_6x10، vertical_8، إلخ
     private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> {
         return when {
             mode.startsWith("grid_") -> {
@@ -358,10 +347,7 @@ class ProComic : HttpSource() {
                     ?: pieceCount
                 Pair(cols, 1)
             }
-            else -> {
-                // fallback: إذا كان mode غير معروف، نفترض عمود واحد لكل قطعة
-                Pair(1, pieceCount.coerceAtLeast(1))
-            }
+            else -> Pair(1, pieceCount.coerceAtLeast(1))
         }
     }
 
@@ -461,8 +447,7 @@ class ProComic : HttpSource() {
         val token: String = "",
     )
 
-    // صف واحد من القطع — الترتيب محلول مسبقاً في pageListParse
-    // pieces[0] = أقصى اليسار ← pieces[cols-1] = أقصى اليمين
+    // صف واحد — القطع مرتبة مسبقاً، pieces[0] = أقصى اليسار
     @Serializable
     data class PageStrip(
         val pieces: List<String>,

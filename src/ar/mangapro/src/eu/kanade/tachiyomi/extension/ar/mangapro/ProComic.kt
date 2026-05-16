@@ -13,10 +13,10 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
-import kotlinx.serialization.json.decodeFromString
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -40,9 +40,6 @@ class ProComic : HttpSource() {
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
     companion object {
-        // ✅ يجب أن يكون https:// حتى يقبله OkHttp ويمر عبر addInterceptor
-        // ❌ procomic-scrambled:// يُرفض من OkHttp قبل وصوله للـ Interceptor
-        //    لأن HttpUrl.parse() لا يقبل إلا http:// و https://
         private const val SCRAMBLED_SCHEME = "https://procomic.pro/__scrambled__/?map="
     }
 
@@ -52,12 +49,10 @@ class ProComic : HttpSource() {
             val url = request.url.toString()
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
-                // فك ترميز Base64 واسترداد خريطة التقطيع
                 val encoded = url.removePrefix(SCRAMBLED_SCHEME)
                 val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
                 val pageMap = json.decodeFromString<PageMap>(mapJson)
 
-                // تحميل القطع ودمجها (يحدث فقط عند عرض هذه الصفحة)
                 val mergedBytes = mergePieces(pageMap)
                     ?: return@addInterceptor Response.Builder()
                         .request(request)
@@ -227,14 +222,12 @@ class ProComic : HttpSource() {
 
         val allPieceUrls = data.data.maps.flatMap { it.pieces }.toSet()
 
-        // الصفحات العادية غير المقطعة
         data.data.images.forEach { url ->
             if (url !in allPieceUrls) {
                 pages.add(Page(index++, imageUrl = url))
             }
         }
 
-        // الصفحات المقطعة: نُشفّر الخريطة فقط — لا تحميل شبكي هنا
         data.data.maps.forEach { map ->
             if (map.pieces.isNotEmpty()) {
                 val mapJson = json.encodeToString(map)
@@ -242,7 +235,6 @@ class ProComic : HttpSource() {
                     mapJson.toByteArray(Charsets.UTF_8),
                     Base64.URL_SAFE or Base64.NO_WRAP,
                 )
-                // الـ Interceptor سيلتقط هذا الرابط ويدمج الصورة عند الطلب
                 pages.add(Page(index++, imageUrl = "$SCRAMBLED_SCHEME$encoded"))
             }
         }

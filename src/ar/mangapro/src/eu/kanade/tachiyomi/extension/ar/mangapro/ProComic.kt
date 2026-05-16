@@ -17,16 +17,17 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Locale
-import eu.kanade.tachiyomi.network.GET as networkGET
 
 class ProComic : HttpSource() {
 
@@ -38,12 +39,32 @@ class ProComic : HttpSource() {
     private val json = Json { ignoreUnknownKeys = true }
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    override val client = network.cloudflareClient
+    companion object {
+        private val pageCache = mutableMapOf<String, ByteArray>()
+        private const val CACHE_PREFIX = "https://procomic.pro/cache/"
+    }
+
+    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url.toString()
+            val cached = pageCache[url]
+            if (cached != null) {
+                Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(cached.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
+            } else {
+                chain.proceed(request)
+            }
+        }
+        .build()
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
-
-    // =================== Popular ===================
 
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
@@ -196,12 +217,14 @@ class ProComic : HttpSource() {
             }
         }
 
-        // الصور المقطعة - ندمجها الآن مباشرة وننشئ ملف مؤقت
+        // الصور المقطعة - ندمجها ونخزنها في cache
         data.data.maps.forEach { map ->
             if (map.pieces.isNotEmpty()) {
-                val mergedUrl = mergePiecesNow(map, chapterId, index)
-                if (mergedUrl != null) {
-                    pages.add(Page(index++, imageUrl = mergedUrl))
+                val cacheKey = "$CACHE_PREFIX$chapterId/$index"
+                val mergedBytes = mergePieces(map)
+                if (mergedBytes != null) {
+                    pageCache[cacheKey] = mergedBytes
+                    pages.add(Page(index++, imageUrl = cacheKey))
                 }
             }
         }
@@ -209,19 +232,21 @@ class ProComic : HttpSource() {
         return pages
     }
 
-    private fun mergePiecesNow(map: PageMap, chapterId: String, index: Int): String? {
+    private fun mergePieces(map: PageMap): ByteArray? {
         return try {
             val (cols, rows) = parseMode(map.mode, map.pieces.size)
 
-            // تحميل القطع
             val bitmaps = mutableListOf<Bitmap?>()
             for (pieceUrl in map.pieces) {
                 val cleanUrl = pieceUrl.replace("&amp;", "&")
-                val req = okhttp3.Request.Builder()
+                val req = Request.Builder()
                     .url(cleanUrl)
                     .header("Referer", "$baseUrl/")
                     .header("Accept", "image/avif,image/webp,image/*,*/*")
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    .header(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    )
                     .build()
                 val resp = client.newCall(req).execute()
                 val bytes = resp.body.bytes()
@@ -229,11 +254,11 @@ class ProComic : HttpSource() {
                 bitmaps.add(decodeBytes(bytes))
             }
 
-            val validBitmaps = bitmaps.filterNotNull()
-            if (validBitmaps.isEmpty()) return null
+            val valid = bitmaps.filterNotNull()
+            if (valid.isEmpty()) return null
 
-            val pieceW = validBitmaps.first().width
-            val pieceH = validBitmaps.first().height
+            val pieceW = valid.first().width
+            val pieceH = valid.first().height
             val totalW = pieceW * cols
             val totalH = pieceH * rows
 
@@ -252,17 +277,11 @@ class ProComic : HttpSource() {
                 canvas.drawBitmap(bmp, (col * pieceW).toFloat(), (row * pieceH).toFloat(), null)
             }
 
-            // حفظ في ملف مؤقت
             val out = ByteArrayOutputStream()
             result.compress(Bitmap.CompressFormat.JPEG, 85, out)
             result.recycle()
             bitmaps.forEach { it?.recycle() }
-
-            // حفظ الملف في مجلد مؤقت وإرجاع مسار file://
-            val tmpFile = File.createTempFile("procomic_${chapterId}_$index", ".jpg")
-            tmpFile.writeBytes(out.toByteArray())
-            tmpFile.deleteOnExit()
-            "file://${tmpFile.absolutePath}"
+            out.toByteArray()
         } catch (e: Exception) {
             null
         }

@@ -17,13 +17,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import rx.Observable
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
@@ -44,27 +43,12 @@ class ProComic : HttpSource() {
         private const val CACHE_PREFIX = "https://procomic.pro/cache/"
     }
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .addInterceptor { chain ->
-            val request = chain.request()
-            val url = request.url.toString()
-            val cached = pageCache[url]
-            if (cached != null) {
-                Response.Builder()
-                    .request(request)
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(cached.toResponseBody("image/jpeg".toMediaType()))
-                    .build()
-            } else {
-                chain.proceed(request)
-            }
-        }
-        .build()
+    override val client = network.cloudflareClient
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
+
+    // =================== Popular ===================
 
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
@@ -210,26 +194,45 @@ class ProComic : HttpSource() {
 
         val allPieces = data.data.maps.flatMap { it.pieces }.toSet()
 
-        // الصور الكاملة
         data.data.images.forEach { url ->
             if (url !in allPieces) {
                 pages.add(Page(index++, imageUrl = url))
             }
         }
 
-        // الصور المقطعة - ندمجها ونخزنها في cache
         data.data.maps.forEach { map ->
             if (map.pieces.isNotEmpty()) {
                 val cacheKey = "$CACHE_PREFIX$chapterId/$index"
                 val mergedBytes = mergePieces(map)
                 if (mergedBytes != null) {
                     pageCache[cacheKey] = mergedBytes
-                    pages.add(Page(index++, imageUrl = cacheKey))
                 }
+                pages.add(Page(index++, imageUrl = cacheKey))
             }
         }
 
         return pages
+    }
+
+    // هذا هو المفتاح - يُستدعى مباشرة عند تحميل الصورة
+    override fun fetchImage(page: Page): Observable<Response> {
+        val imageUrl = page.imageUrl ?: return super.fetchImage(page)
+
+        if (imageUrl.startsWith(CACHE_PREFIX)) {
+            val cached = pageCache[imageUrl]
+            if (cached != null) {
+                val response = Response.Builder()
+                    .request(Request.Builder().url(imageUrl).build())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(cached.toResponseBody("image/jpeg".toMediaType()))
+                    .build()
+                return Observable.just(response)
+            }
+        }
+
+        return super.fetchImage(page)
     }
 
     private fun mergePieces(map: PageMap): ByteArray? {

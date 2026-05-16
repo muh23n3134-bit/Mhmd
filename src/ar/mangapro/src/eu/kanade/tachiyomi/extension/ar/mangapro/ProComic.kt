@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
+import tachiyomi.decoder.ImageDecoder
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -24,7 +25,6 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import tachiyomi.decoder.ImageDecoder
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -50,10 +50,10 @@ class ProComic : HttpSource() {
 
             if (url.startsWith(SCRAMBLED_SCHEME)) {
                 val encoded = url.removePrefix(SCRAMBLED_SCHEME)
-                val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
-                val pageMap = json.decodeFromString<PageMap>(mapJson)
+                val stripJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP))
+                val strip = json.decodeFromString<PageStrip>(stripJson)
 
-                val mergedBytes = mergePieces(pageMap)
+                val mergedBytes = mergeStrip(strip)
                     ?: return@addInterceptor Response.Builder()
                         .request(request)
                         .protocol(Protocol.HTTP_1_1)
@@ -222,17 +222,43 @@ class ProComic : HttpSource() {
 
         val allPieceUrls = data.data.maps.flatMap { it.pieces }.toSet()
 
+        // الصفحات العادية غير المقطعة
         data.data.images.forEach { url ->
             if (url !in allPieceUrls) {
                 pages.add(Page(index++, imageUrl = url))
             }
         }
 
+        // الصفحات المقطعة — صفحة واحدة لكل صف في الشبكة
+        // مثال: grid_5x8 (5 أعمدة × 8 صفوف) → 8 صفحات منفصلة
+        // يدعم أي عدد أعمدة (2، 3، 4، 5، 6، أو أكثر)
         data.data.maps.forEach { map ->
-            if (map.pieces.isNotEmpty()) {
-                val mapJson = json.encodeToString(map)
+            if (map.pieces.isEmpty()) return@forEach
+
+            val (cols, rows) = parseMode(map.mode, map.pieces.size)
+            val total = cols * rows
+
+            // حلّ order مسبقاً: orderedPieces[destPos] = رابط القطعة الصحيحة
+            // order[srcIdx] = destPos: القطعة رقم srcIdx تذهب إلى الموضع destPos
+            val orderedPieces = Array(total) { "" }
+            for (srcIdx in map.pieces.indices) {
+                val destPos = map.order.getOrElse(srcIdx) { srcIdx }
+                if (destPos in 0 until total) {
+                    orderedPieces[destPos] = map.pieces[srcIdx]
+                }
+            }
+
+            // أنشئ صفحة واحدة لكل صف — كل صفحة = (cols) قطعة جنباً إلى جنب
+            for (rowIdx in 0 until rows) {
+                val rowPieces = (0 until cols).mapNotNull { col ->
+                    orderedPieces.getOrElse(rowIdx * cols + col) { "" }
+                        .replace("&amp;", "&")
+                        .takeIf { it.isNotEmpty() }
+                }
+                if (rowPieces.isEmpty()) continue
+                val strip = PageStrip(pieces = rowPieces)
                 val encoded = Base64.encodeToString(
-                    mapJson.toByteArray(Charsets.UTF_8),
+                    json.encodeToString(strip).toByteArray(Charsets.UTF_8),
                     Base64.URL_SAFE or Base64.NO_WRAP,
                 )
                 pages.add(Page(index++, imageUrl = "$SCRAMBLED_SCHEME$encoded"))
@@ -244,15 +270,32 @@ class ProComic : HttpSource() {
 
     override fun imageUrlParse(response: Response) = ""
 
-    private fun mergePieces(map: PageMap): ByteArray? {
+    // يدمج قطع صف واحد أفقياً — القطع مرتبة مسبقاً، لا يوجد إعادة ترتيب هنا
+    // يدعم أي عدد قطع في الصف (cols) بغض النظر عن القيمة
+    private fun mergeStrip(strip: PageStrip): ByteArray? {
+        // قطعة واحدة فقط: أعدها مباشرة بدون Canvas لتوفير الذاكرة
+        if (strip.pieces.size == 1) {
+            return runCatching {
+                val req = Request.Builder()
+                    .url(strip.pieces[0])
+                    .header("Referer", "$baseUrl/")
+                    .header("Accept", "image/avif,image/webp,image/*,*/*")
+                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
+                    .build()
+                val resp = client.newCall(req).execute()
+                val bytes = resp.body.bytes()
+                resp.close()
+                bytes
+            }.getOrNull()
+        }
+
         val bitmaps = mutableListOf<Bitmap?>()
         return try {
-            val (cols, rows) = parseMode(map.mode, map.pieces.size)
-
-            for (pieceUrl in map.pieces) {
-                val cleanUrl = pieceUrl.replace("&amp;", "&")
+            // حمّل كل قطعة في الصف بالترتيب
+            // pieces[0] = أقصى اليسار، pieces[cols-1] = أقصى اليمين
+            for (pieceUrl in strip.pieces) {
                 val req = Request.Builder()
-                    .url(cleanUrl)
+                    .url(pieceUrl)
                     .header("Referer", "$baseUrl/")
                     .header("Accept", "image/avif,image/webp,image/*,*/*")
                     .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
@@ -266,29 +309,23 @@ class ProComic : HttpSource() {
             val valid = bitmaps.filterNotNull()
             if (valid.isEmpty()) return null
 
+            // ارسم القطع أفقياً جنباً إلى جنب
+            // يدعم أي عدد قطع: 2، 3، 4، 5، 6، أو أكثر
             val pieceW = valid.first().width
-            val pieceH = valid.first().height
-            val totalW = pieceW * cols
-            val totalH = pieceH * rows
+            val pieceH = valid.maxOf { it.height }
+            val totalW = valid.sumOf { it.width }
 
-            val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
+            val result = Bitmap.createBitmap(totalW, pieceH, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(result)
-
-            // order[i] = الموضع الذي تذهب إليه القطعة i
-            for (srcIdx in 0 until (cols * rows)) {
-                val destPos = if (map.order.isNotEmpty()) {
-                    map.order.getOrElse(srcIdx) { srcIdx }
-                } else {
-                    srcIdx
-                }
-                val bmp = bitmaps.getOrNull(srcIdx) ?: continue
-                val col = destPos % cols
-                val row = destPos / cols
-                canvas.drawBitmap(bmp, (col * pieceW).toFloat(), (row * pieceH).toFloat(), null)
+            var xOffset = 0f
+            for (bmp in valid) {
+                canvas.drawBitmap(bmp, xOffset, 0f, null)
+                xOffset += bmp.width
             }
 
             val out = ByteArrayOutputStream()
-            result.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            result.compress(Bitmap.CompressFormat.JPEG, 90, out)
+
             result.recycle()
             bitmaps.forEach { it?.recycle() }
             bitmaps.clear()
@@ -298,6 +335,33 @@ class ProComic : HttpSource() {
             bitmaps.forEach { it?.recycle() }
             bitmaps.clear()
             null
+        }
+    }
+
+    // يفكك صيغة الـ mode ويعيد (cols, rows)
+    // يدعم أي قيمة: grid_2x5، grid_4x3، grid_6x10، vertical_8، إلخ
+    private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> {
+        return when {
+            mode.startsWith("grid_") -> {
+                val parts = mode.removePrefix("grid_").split("x")
+                val cols = parts.getOrNull(0)?.toIntOrNull()?.takeIf { it > 0 } ?: 1
+                val rows = parts.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 } ?: 1
+                Pair(cols, rows)
+            }
+            mode.startsWith("vertical_") -> {
+                val rows = mode.removePrefix("vertical_").toIntOrNull()?.takeIf { it > 0 }
+                    ?: pieceCount
+                Pair(1, rows)
+            }
+            mode.startsWith("horizontal_") -> {
+                val cols = mode.removePrefix("horizontal_").toIntOrNull()?.takeIf { it > 0 }
+                    ?: pieceCount
+                Pair(cols, 1)
+            }
+            else -> {
+                // fallback: إذا كان mode غير معروف، نفترض عمود واحد لكل قطعة
+                Pair(1, pieceCount.coerceAtLeast(1))
+            }
         }
     }
 
@@ -311,22 +375,6 @@ class ProComic : HttpSource() {
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } finally {
             decoder.recycle()
-        }
-    }
-
-    private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> {
-        return when {
-            mode.startsWith("grid_") -> {
-                val parts = mode.removePrefix("grid_").split("x")
-                Pair(
-                    parts.getOrNull(0)?.toIntOrNull() ?: 1,
-                    parts.getOrNull(1)?.toIntOrNull() ?: 1,
-                )
-            }
-            mode.startsWith("vertical_") -> {
-                Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
-            }
-            else -> Pair(1, pieceCount)
         }
     }
 
@@ -411,5 +459,12 @@ class ProComic : HttpSource() {
         val pieces: List<String> = emptyList(),
         val order: List<Int> = emptyList(),
         val token: String = "",
+    )
+
+    // صف واحد من القطع — الترتيب محلول مسبقاً في pageListParse
+    // pieces[0] = أقصى اليسار ← pieces[cols-1] = أقصى اليمين
+    @Serializable
+    data class PageStrip(
+        val pieces: List<String>,
     )
 }

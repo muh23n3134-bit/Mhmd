@@ -274,15 +274,20 @@ class ProComic : HttpSource() {
             val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(result)
 
-            for (pos in 0 until (cols * rows)) {
-                val srcIdx = if (map.order.isNotEmpty()) {
-                    map.order.getOrElse(pos) { pos }
+            // ✅ الإصلاح: order[i] = الموضع الذي تذهب إليه القطعة i
+            // مثال: order=[5,2,1,0,4,3]
+            //   → القطعة 0 (pieces[0]) تُرسم في الموضع 5
+            //   → القطعة 1 (pieces[1]) تُرسم في الموضع 2
+            //   → القطعة 3 (pieces[3]) تُرسم في الموضع 0  ... إلخ
+            for (srcIdx in 0 until (cols * rows)) {
+                val destPos = if (map.order.isNotEmpty()) {
+                    map.order.getOrElse(srcIdx) { srcIdx }
                 } else {
-                    pos
+                    srcIdx
                 }
                 val bmp = bitmaps.getOrNull(srcIdx) ?: continue
-                val col = pos % cols
-                val row = pos / cols
+                val col = destPos % cols
+                val row = destPos / cols
                 canvas.drawBitmap(bmp, (col * pieceW).toFloat(), (row * pieceH).toFloat(), null)
             }
 

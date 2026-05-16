@@ -251,15 +251,38 @@ class ProComic : HttpSource() {
 
             for (pieceUrl in map.pieces) {
                 val cleanUrl = pieceUrl.replace("&amp;", "&")
+                // نُضيف الـ token كـ query parameter إذا كان موجوداً
+                val urlWithToken = if (map.token.isNotEmpty()) {
+                    val separator = if (cleanUrl.contains("?")) "&" else "?"
+                    "$cleanUrl${separator}cdn_token=${map.token}"
+                } else {
+                    cleanUrl
+                }
                 val req = Request.Builder()
-                    .url(cleanUrl)
+                    .url(urlWithToken)
                     .header("Referer", "$baseUrl/")
                     .header("Accept", "image/avif,image/webp,image/*,*/*")
                     .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
                     .build()
                 val resp = client.newCall(req).execute()
-                val bytes = resp.body.bytes()
-                resp.close()
+                // إذا فشل الطلب مع الـ token، نجرب بدونه
+                val bytes = if (resp.code == 403 || resp.code == 401) {
+                    resp.close()
+                    val fallbackReq = Request.Builder()
+                        .url(cleanUrl)
+                        .header("Referer", "$baseUrl/")
+                        .header("Accept", "image/avif,image/webp,image/*,*/*")
+                        .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
+                        .build()
+                    val fallbackResp = client.newCall(fallbackReq).execute()
+                    val b = fallbackResp.body.bytes()
+                    fallbackResp.close()
+                    b
+                } else {
+                    val b = resp.body.bytes()
+                    resp.close()
+                    b
+                }
                 bitmaps.add(decodeBytes(bytes))
             }
 
@@ -274,11 +297,7 @@ class ProComic : HttpSource() {
             val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(result)
 
-            // ✅ الإصلاح: order[i] = الموضع الذي تذهب إليه القطعة i
-            // مثال: order=[5,2,1,0,4,3]
-            //   → القطعة 0 (pieces[0]) تُرسم في الموضع 5
-            //   → القطعة 1 (pieces[1]) تُرسم في الموضع 2
-            //   → القطعة 3 (pieces[3]) تُرسم في الموضع 0  ... إلخ
+            // order[i] = الموضع الذي تذهب إليه القطعة i في الصورة النهائية
             for (srcIdx in 0 until (cols * rows)) {
                 val destPos = if (map.order.isNotEmpty()) {
                     map.order.getOrElse(srcIdx) { srcIdx }
@@ -414,5 +433,6 @@ class ProComic : HttpSource() {
         val mode: String = "",
         val pieces: List<String> = emptyList(),
         val order: List<Int> = emptyList(),
+        val token: String = "",
     )
 }

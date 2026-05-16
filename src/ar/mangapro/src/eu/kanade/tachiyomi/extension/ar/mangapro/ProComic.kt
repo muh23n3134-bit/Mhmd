@@ -3,6 +3,8 @@ package eu.kanade.tachiyomi.extension.ar.mangapro
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ImageDecoder
+import android.os.Build
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -23,6 +25,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -41,7 +44,6 @@ class ProComic : HttpSource() {
         private const val MERGE_PREFIX = "https://procomic.pro/img/"
     }
 
-    // نموذج لتخزين بيانات الصفحة المقطعة
     data class PageMapData(
         val pieces: List<String>,
         val order: List<Int>,
@@ -92,26 +94,27 @@ class ProComic : HttpSource() {
             }
         }
 
+        private fun decodeBytes(bytes: ByteArray): Bitmap? {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                try {
+                    val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+                    ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    }
+                } catch (e: Exception) {
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }
+            } else {
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+        }
+
         private fun assemblePage(
             chain: Interceptor.Chain,
             original: Request,
             mapData: PageMapData,
         ): ByteArray {
-            // تحديد الشبكة من الـ mode
-            // grid_3x2 = 3 أعمدة × 2 صفوف = 6 قطع
-            // grid_2x1 = 2 أعمدة × 1 صف
-            // vertical_2 = عمود واحد × 2 صفوف
             val (cols, rows) = parseMode(mapData.mode, mapData.pieces.size)
-
-            // إعادة الترتيب - order[i] = فهرس القطعة التي تذهب للموضع i
-            val orderedPieces = if (mapData.order.isNotEmpty()) {
-                List(mapData.pieces.size) { i ->
-                    val srcIdx = mapData.order.indexOf(i)
-                    if (srcIdx >= 0) mapData.pieces.getOrNull(srcIdx) else null
-                }.filterNotNull()
-            } else {
-                mapData.pieces
-            }
 
             // تحميل كل القطع
             val bitmaps = mutableListOf<Bitmap?>()
@@ -121,12 +124,15 @@ class ProComic : HttpSource() {
                     .url(cleanUrl)
                     .header("Referer", "$baseUrl/")
                     .header("Accept", "image/avif,image/webp,image/*,*/*")
-                    .header("User-Agent", original.header("User-Agent") ?: "Mozilla/5.0")
+                    .header(
+                        "User-Agent",
+                        original.header("User-Agent") ?: "Mozilla/5.0",
+                    )
                     .build()
                 val resp = chain.proceed(req)
                 val bytes = resp.body.bytes()
                 resp.close()
-                bitmaps.add(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+                bitmaps.add(decodeBytes(bytes))
             }
 
             try {
@@ -141,7 +147,7 @@ class ProComic : HttpSource() {
                 val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(result)
 
-                // نرسم كل قطعة في موضعها الصحيح حسب الـ order
+                // نرسم كل قطعة في موضعها حسب الـ order
                 for (pos in 0 until (cols * rows)) {
                     val srcIdx = if (mapData.order.isNotEmpty()) {
                         mapData.order.getOrElse(pos) { pos }
@@ -149,7 +155,6 @@ class ProComic : HttpSource() {
                         pos
                     }
                     val bmp = bitmaps.getOrNull(srcIdx) ?: continue
-
                     val col = pos % cols
                     val row = pos / cols
                     canvas.drawBitmap(bmp, (col * pieceW).toFloat(), (row * pieceH).toFloat(), null)
@@ -164,25 +169,19 @@ class ProComic : HttpSource() {
             }
         }
 
-        // استخراج عدد الأعمدة والصفوف من الـ mode
         private fun parseMode(mode: String, pieceCount: Int): Pair<Int, Int> {
             return when {
                 mode.startsWith("grid_") -> {
-                    // grid_3x2 → cols=3, rows=2
                     val parts = mode.removePrefix("grid_").split("x")
                     val cols = parts.getOrNull(0)?.toIntOrNull() ?: 1
                     val rows = parts.getOrNull(1)?.toIntOrNull() ?: 1
                     Pair(cols, rows)
                 }
                 mode.startsWith("vertical_") -> {
-                    // vertical_5 → cols=1, rows=5
                     val rows = mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount
                     Pair(1, rows)
                 }
-                else -> {
-                    // افتراضي: عمود واحد
-                    Pair(1, pieceCount)
-                }
+                else -> Pair(1, pieceCount)
             }
         }
     }
@@ -334,14 +333,12 @@ class ProComic : HttpSource() {
 
         val allPieces = data.data.maps.flatMap { it.pieces }.toSet()
 
-        // الصور الكاملة
         data.data.images.forEach { url ->
             if (url !in allPieces) {
                 pages.add(Page(index++, imageUrl = url))
             }
         }
 
-        // الصور المقطعة مع بيانات الشبكة
         data.data.maps.forEach { map ->
             if (map.pieces.isNotEmpty()) {
                 val key = "$MERGE_PREFIX$chapterId/$index"

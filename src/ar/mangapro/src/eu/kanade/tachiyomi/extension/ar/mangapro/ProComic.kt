@@ -48,8 +48,6 @@ class ProComic : HttpSource() {
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
-    // =================== Popular ===================
-
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
@@ -214,44 +212,67 @@ class ProComic : HttpSource() {
         return pages
     }
 
-    // هذا هو المفتاح - يُستدعى مباشرة عند تحميل الصورة
-    override fun fetchImage(page: Page): Observable<Response> {
-        val imageUrl = page.imageUrl ?: return super.fetchImage(page)
+    // الدالة الوحيدة غير final التي تتحكم في تحميل الصور
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+        return super.fetchPageList(chapter)
+    }
 
-        if (imageUrl.startsWith(CACHE_PREFIX)) {
-            val cached = pageCache[imageUrl]
+    override fun imageUrlRequest(page: Page): Request {
+        val imageUrl = page.imageUrl!!
+        // إذا كان الرابط في الـ cache نرجعه مباشرة
+        return Request.Builder()
+            .url(imageUrl)
+            .headers(headers)
+            .build()
+    }
+
+    override fun imageUrlParse(response: Response): String {
+        return response.request.url.toString()
+    }
+
+    // هنا نتحكم في استجابة الصورة
+    override fun imageRequest(page: Page): Request {
+        val imageUrl = page.imageUrl!!
+        return Request.Builder()
+            .url(imageUrl)
+            .headers(headers)
+            .build()
+    }
+
+    // الدالة الأساسية - نبني client خاص يعترض طلبات الـ cache
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val url = request.url.toString()
+            val cached = pageCache[url]
             if (cached != null) {
-                val response = Response.Builder()
-                    .request(Request.Builder().url(imageUrl).build())
+                Response.Builder()
+                    .request(request)
                     .protocol(Protocol.HTTP_1_1)
                     .code(200)
                     .message("OK")
                     .body(cached.toResponseBody("image/jpeg".toMediaType()))
                     .build()
-                return Observable.just(response)
+            } else {
+                chain.proceed(request)
             }
         }
-
-        return super.fetchImage(page)
-    }
+        .build()
 
     private fun mergePieces(map: PageMap): ByteArray? {
         return try {
             val (cols, rows) = parseMode(map.mode, map.pieces.size)
-
             val bitmaps = mutableListOf<Bitmap?>()
+
             for (pieceUrl in map.pieces) {
                 val cleanUrl = pieceUrl.replace("&amp;", "&")
                 val req = Request.Builder()
                     .url(cleanUrl)
                     .header("Referer", "$baseUrl/")
                     .header("Accept", "image/avif,image/webp,image/*,*/*")
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    )
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                     .build()
-                val resp = client.newCall(req).execute()
+                val resp = network.cloudflareClient.newCall(req).execute()
                 val bytes = resp.body.bytes()
                 resp.close()
                 bitmaps.add(decodeBytes(bytes))
@@ -269,11 +290,7 @@ class ProComic : HttpSource() {
             val canvas = Canvas(result)
 
             for (pos in 0 until (cols * rows)) {
-                val srcIdx = if (map.order.isNotEmpty()) {
-                    map.order.getOrElse(pos) { pos }
-                } else {
-                    pos
-                }
+                val srcIdx = if (map.order.isNotEmpty()) map.order.getOrElse(pos) { pos } else pos
                 val bmp = bitmaps.getOrNull(srcIdx) ?: continue
                 val col = pos % cols
                 val row = pos / cols
@@ -309,28 +326,18 @@ class ProComic : HttpSource() {
         return when {
             mode.startsWith("grid_") -> {
                 val parts = mode.removePrefix("grid_").split("x")
-                val cols = parts.getOrNull(0)?.toIntOrNull() ?: 1
-                val rows = parts.getOrNull(1)?.toIntOrNull() ?: 1
-                Pair(cols, rows)
+                Pair(parts.getOrNull(0)?.toIntOrNull() ?: 1, parts.getOrNull(1)?.toIntOrNull() ?: 1)
             }
-            mode.startsWith("vertical_") -> {
-                val rows = mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount
-                Pair(1, rows)
-            }
+            mode.startsWith("vertical_") -> Pair(1, mode.removePrefix("vertical_").toIntOrNull() ?: pieceCount)
             else -> Pair(1, pieceCount)
         }
     }
-
-    override fun imageUrlParse(response: Response) = ""
 
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())
 
     @Serializable
-    data class LatestUpdatesResponse(
-        val success: Boolean = false,
-        val data: List<SeriesDto> = emptyList(),
-    )
+    data class LatestUpdatesResponse(val success: Boolean = false, val data: List<SeriesDto> = emptyList())
 
     @Serializable
     data class SeriesDto(
@@ -344,42 +351,25 @@ class ProComic : HttpSource() {
         fun toSManga() = SManga.create().apply {
             url = "$type/$id/$slug"
             title = this@SeriesDto.title
-            thumbnail_url = coverImageApp?.card?.mobile
-                ?: coverImageApp?.desktop
-                ?: coverImage
+            thumbnail_url = coverImageApp?.card?.mobile ?: coverImageApp?.desktop ?: coverImage
         }
     }
 
     @Serializable
-    data class CoverImageApp(
-        val desktop: String? = null,
-        val card: CardImages? = null,
-    )
+    data class CoverImageApp(val desktop: String? = null, val card: CardImages? = null)
 
     @Serializable
-    data class CardImages(
-        val mobile: String? = null,
-        val desktop: String? = null,
-    )
+    data class CardImages(val mobile: String? = null, val desktop: String? = null)
 
     @Serializable
     data class SeriesDetailResponse(
-        val id: Int = 0,
-        val title: String? = null,
-        val slug: String? = null,
-        val coverImage: String? = null,
-        val author: String? = null,
-        val artist: String? = null,
-        val description: String? = null,
-        val synopsis: String? = null,
-        val status: String? = null,
+        val id: Int = 0, val title: String? = null, val slug: String? = null,
+        val coverImage: String? = null, val author: String? = null, val artist: String? = null,
+        val description: String? = null, val synopsis: String? = null, val status: String? = null,
     )
 
     @Serializable
-    data class ChaptersResponse(
-        val data: List<ChapterDto> = emptyList(),
-        val total: Int = 0,
-    )
+    data class ChaptersResponse(val data: List<ChapterDto> = emptyList(), val total: Int = 0)
 
     @Serializable
     data class ChapterDto(
@@ -391,10 +381,7 @@ class ProComic : HttpSource() {
     )
 
     @Serializable
-    data class ChapterDeferredResponse(
-        val success: Boolean = false,
-        val data: ChapterDeferredData? = null,
-    )
+    data class ChapterDeferredResponse(val success: Boolean = false, val data: ChapterDeferredData? = null)
 
     @Serializable
     data class ChapterDeferredData(

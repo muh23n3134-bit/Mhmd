@@ -18,7 +18,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.decodeFromStream
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -38,8 +37,10 @@ class ProComic : HttpSource() {
     override val lang = "ar"
     override val supportsLatest = true
 
+    // إعداد الـ Json ليكون متسامحاً مع أي حقول ناقصة أو جديدة
     private val json = Json {
         ignoreUnknownKeys = true
+        isLenient = true
         explicitNulls = false
     }
 
@@ -47,31 +48,13 @@ class ProComic : HttpSource() {
 
     private companion object {
         const val SCRAMBLED_PATH = "__scrambled__"
-
-        /*
-         * إذا كان ترتيب الصور المقطعة خطأ، غيّر هذه القيمة إلى true.
-         *
-         * false = order[مكان الرسم] = رقم القطعة
-         * true  = order[رقم القطعة] = مكان الرسم
-         */
         const val ORDER_IS_TARGET_INDEX = false
-
-        /*
-         * إذا كانت صفحات الفصل كلها مقلوبة من النهاية للبداية، غيّرها إلى true.
-         */
         const val REVERSE_SPLITS = false
-
-        /*
-         * إذا الصور العادية فقط مقلوبة، غيّرها إلى true.
-         */
         const val REVERSE_NORMAL_IMAGES = false
-
-        /*
-         * إذا الصور المقطعة فقط مقلوبة، غيّرها إلى true.
-         */
         const val REVERSE_MAPS = false
     }
 
+    // إعداد الـ Interceptor لاعتراض الروابط الوهمية ودمج الصور
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .addInterceptor { chain ->
             val request = chain.request()
@@ -93,10 +76,11 @@ class ProComic : HttpSource() {
                 val bitmap = reconstructImage(map, chain, request)
 
                 val output = ByteArrayOutputStream()
+                // استخدام جودة عالية للـ JPEG
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)
                 val bytes = output.toByteArray()
 
-                bitmap.recycle()
+                bitmap.recycle() // تفريغ الذاكرة فور الانتهاء
 
                 Response.Builder()
                     .request(request)
@@ -294,11 +278,12 @@ class ProComic : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
+        val html = response.body?.string() ?: return emptyList()
 
         val urlParts = response.request.url.toString().split("/")
         val chapterId = urlParts.getOrElse(urlParts.size - 2) { "0" }
 
+        // استخراج التوكن من الـ HTML
         val token = Regex(
             """eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""",
         ).find(html)?.value ?: return emptyList()
@@ -308,6 +293,7 @@ class ProComic : HttpSource() {
             .set("Referer", response.request.url.toString())
             .build()
 
+        // طلب الـ split الأول (يحتوي على معلومات عدد الـ splits الكلية)
         val firstResult = try {
             client.newCall(
                 GET("$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0", apiHeaders),
@@ -321,9 +307,12 @@ class ProComic : HttpSource() {
         }
 
         val splitIndex = firstResult.data.splitIndex.coerceAtLeast(1)
-
         val splitDataList = mutableListOf<ChapterDeferredData>()
+        
+        // --- خطوة حاسمة: إضافة الدفعة الأولى دائماً لكي لا تفقد الصفحات الأولى ---
+        splitDataList.add(firstResult.data)
 
+        // جلب باقي الدفعات (إن وجدت)
         for (split in 1..splitIndex) {
             val result = try {
                 client.newCall(
@@ -338,10 +327,6 @@ class ProComic : HttpSource() {
             }
         }
 
-        if (splitDataList.isEmpty()) {
-            splitDataList.add(firstResult.data)
-        }
-
         val orderedSplitData = if (REVERSE_SPLITS) {
             splitDataList.asReversed()
         } else {
@@ -353,26 +338,18 @@ class ProComic : HttpSource() {
         var pageIndex = 0
 
         for (splitData in orderedSplitData) {
-            val images = if (REVERSE_NORMAL_IMAGES) {
-                splitData.images.asReversed()
-            } else {
-                splitData.images
-            }
-
+            
+            // 1. إضافة الصور العادية (مانجا)
+            val images = if (REVERSE_NORMAL_IMAGES) splitData.images.asReversed() else splitData.images
             images.forEach { imageUrl ->
                 val cleanUrl = imageUrl.cleanUrl()
-
                 if (cleanUrl.isNotBlank() && seen.add(cleanUrl)) {
                     pages.add(Page(pageIndex++, imageUrl = cleanUrl.toAbsoluteUrl()))
                 }
             }
 
-            val maps = if (REVERSE_MAPS) {
-                splitData.maps.asReversed()
-            } else {
-                splitData.maps
-            }
-
+            // 2. إضافة الصور المقطعة (مانهوا مقطعة)
+            val maps = if (REVERSE_MAPS) splitData.maps.asReversed() else splitData.maps
             maps.forEach { map ->
                 if (map.pieces.isEmpty()) return@forEach
 
@@ -386,6 +363,7 @@ class ProComic : HttpSource() {
                     order = map.order,
                 )
 
+                // تحويل بيانات الصفحة لـ Base64 لطلبها لاحقاً عبر الـ Interceptor
                 pages.add(Page(pageIndex++, imageUrl = encodeMergeMap(mergeMap)))
             }
         }
@@ -396,7 +374,7 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response): String = ""
 
     // =========================
-    // Image Reconstruction
+    // Image Reconstruction (دمج الصور المقطعة)
     // =========================
 
     private fun encodeMergeMap(map: MergeMap): String {
@@ -417,6 +395,7 @@ class ProComic : HttpSource() {
         chain: okhttp3.Interceptor.Chain,
         originalRequest: Request,
     ): Bitmap {
+        // تحديد أبعاد الـ Canvas
         val width = map.dim.getOrNull(0)?.takeIf { it > 0 } ?: 800
         val height = map.dim.getOrNull(1)?.takeIf { it > 0 } ?: 1200
 
@@ -424,28 +403,24 @@ class ProComic : HttpSource() {
         var cols = 1
         var rows = pieceCount
 
+        // تحليل منطق التقسيم (mode) ديناميكياً
         when {
             map.mode.startsWith("grid_") -> {
                 val parts = map.mode.removePrefix("grid_").split("x")
                 cols = parts.getOrNull(0)?.toIntOrNull()?.takeIf { it > 0 } ?: 1
                 rows = parts.getOrNull(1)?.toIntOrNull()?.takeIf { it > 0 } ?: 1
             }
-
             map.mode.startsWith("vertical_") -> {
                 cols = 1
-                rows = map.mode.removePrefix("vertical_").toIntOrNull()
-                    ?.takeIf { it > 0 }
-                    ?: pieceCount
+                rows = map.mode.removePrefix("vertical_").toIntOrNull()?.takeIf { it > 0 } ?: pieceCount
             }
-
             map.mode.startsWith("horizontal_") -> {
-                cols = map.mode.removePrefix("horizontal_").toIntOrNull()
-                    ?.takeIf { it > 0 }
-                    ?: pieceCount
+                cols = map.mode.removePrefix("horizontal_").toIntOrNull()?.takeIf { it > 0 } ?: pieceCount
                 rows = 1
             }
         }
 
+        // في حال كان التقسيم المُعلن أقل من عدد القطع الفعلية
         if (cols * rows < pieceCount) {
             rows = (pieceCount + cols - 1) / cols
         }
@@ -454,6 +429,7 @@ class ProComic : HttpSource() {
         val canvas = Canvas(result)
         canvas.drawColor(Color.WHITE)
 
+        // دالة فرعية مسؤولة عن رسم قطعة واحدة في مكانها المخصص
         fun drawPiece(pieceUrl: String, targetIndex: Int) {
             if (targetIndex < 0 || targetIndex >= cols * rows) return
 
@@ -461,7 +437,7 @@ class ProComic : HttpSource() {
                 .url(pieceUrl.toAbsoluteUrl())
                 .header("Referer", "$baseUrl/")
                 .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
-                .header("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                 .build()
 
             val pieceBitmap = chain.proceed(pieceRequest).use { pieceResponse ->
@@ -469,12 +445,12 @@ class ProComic : HttpSource() {
                     throw Exception("فشل تحميل قطعة الصورة: HTTP ${pieceResponse.code}")
                 }
 
-                val bytes = pieceResponse.body.bytes()
-
-                decodeBytes(bytes)
-                    ?: throw Exception("فشل فك تشفير قطعة الصورة")
+                // تجنب انهيار التطبيق إذا كانت الاستجابة فارغة
+                val bytes = pieceResponse.body?.bytes() ?: throw Exception("محتوى الصورة فارغ")
+                decodeBytes(bytes) ?: throw Exception("فشل فك تشفير قطعة الصورة")
             }
 
+            // تحديد إحداثيات الرسم (تجنب الفراغات باستخدام القسمة الدقيقة)
             val col = targetIndex % cols
             val row = targetIndex / cols
 
@@ -485,29 +461,26 @@ class ProComic : HttpSource() {
 
             val dst = Rect(left, top, right, bottom)
 
+            // رسم القطعة وتفريغها من الذاكرة فوراً
             canvas.drawBitmap(pieceBitmap, null, dst, null)
             pieceBitmap.recycle()
         }
 
+        // توجيه كل قطعة لمكانها الصحيح بناءً على مصفوفة الترتيب
         if (map.order.isNotEmpty() && map.order.size == map.pieces.size) {
             if (ORDER_IS_TARGET_INDEX) {
-                /*
-                 * order[sourceIndex] = targetIndex
-                 */
                 map.pieces.forEachIndexed { sourceIndex, pieceUrl ->
                     val targetIndex = map.order.getOrNull(sourceIndex) ?: sourceIndex
                     drawPiece(pieceUrl, targetIndex)
                 }
             } else {
-                /*
-                 * order[targetIndex] = sourceIndex
-                 */
                 map.order.forEachIndexed { targetIndex, sourceIndex ->
                     val pieceUrl = map.pieces.getOrNull(sourceIndex) ?: return@forEachIndexed
                     drawPiece(pieceUrl, targetIndex)
                 }
             }
         } else {
+            // في حال عدم وجود مصفوفة ترتيب، نرسمها بالتسلسل
             map.pieces.forEachIndexed { index, pieceUrl ->
                 drawPiece(pieceUrl, index)
             }
@@ -519,7 +492,6 @@ class ProComic : HttpSource() {
     private fun decodeBytes(bytes: ByteArray): Bitmap? {
         val decodedByTachiyomi = runCatching {
             val decoder = ImageDecoder.newInstance(bytes.inputStream()) ?: return@runCatching null
-
             try {
                 decoder.decode()
             } finally {
@@ -547,8 +519,10 @@ class ProComic : HttpSource() {
         }
     }
 
+    // الحل الجذري لمشكلة @OptIn في decodeFromStream باستخدام String
     private inline fun <reified T> Response.parseAs(): T {
-        return json.decodeFromStream(body.byteStream())
+        val responseBody = body?.string() ?: throw Exception("الاستجابة من الخادم فارغة")
+        return json.decodeFromString(responseBody)
     }
 
     // =========================
@@ -563,15 +537,9 @@ class ProComic : HttpSource() {
 
     @Serializable
     data class SeriesDto(
-        @SerialName("mangaId")
-        val id: Int = 0,
-
-        @SerialName("mangaSlug")
-        val slug: String = "",
-
-        @SerialName("mangaTitle")
-        val title: String = "",
-
+        @SerialName("mangaId") val id: Int = 0,
+        @SerialName("mangaSlug") val slug: String = "",
+        @SerialName("mangaTitle") val title: String = "",
         val coverImage: String? = null,
         val type: String = "manga",
         val coverImageApp: CoverImageApp? = null,
@@ -621,15 +589,9 @@ class ProComic : HttpSource() {
     @Serializable
     data class ChapterDto(
         val id: Int = 0,
-
-        @SerialName("chapter_number")
-        val chapterNumber: String = "0",
-
+        @SerialName("chapter_number") val chapterNumber: String = "0",
         val title: String? = null,
-
-        @SerialName("published_at")
-        val publishedAt: String? = null,
-
+        @SerialName("published_at") val publishedAt: String? = null,
         val lockedByCoins: Boolean? = null,
     )
 

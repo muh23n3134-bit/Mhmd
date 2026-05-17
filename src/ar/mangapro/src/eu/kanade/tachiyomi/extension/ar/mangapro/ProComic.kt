@@ -207,81 +207,73 @@ class ProComic : HttpSource() {
 
         val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
 
-        val firstResp = client.newCall(
+        // جلب split=0 أولاً
+        val split0Resp = client.newCall(
             GET("$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0", apiHeaders),
         ).execute()
-        val firstData = firstResp.parseAs<ChapterDeferredResponse>()
-        if (!firstData.success || firstData.data == null) return emptyList()
+        val split0Data = split0Resp.parseAs<ChapterDeferredResponse>()
+        if (!split0Data.success || split0Data.data == null) return emptyList()
 
-        // جلب كل الـ splits
-        val allData = mutableListOf<ChapterDeferredData>()
-        val splitIndex = firstData.data.splitIndex.coerceAtLeast(1)
+        // جمع كل splits بدءاً من 0
+        val allSplits = mutableListOf(split0Data.data)
+        val totalSplits = split0Data.data.splitIndex
 
-        for (s in 1..splitIndex) {
-            val resp = client.newCall(
-                GET("$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=$s", apiHeaders),
-            ).execute()
-            val result = resp.parseAs<ChapterDeferredResponse>()
-            if (result.success && result.data != null) {
-                allData.add(result.data)
+        for (s in 1..totalSplits) {
+            try {
+                val resp = client.newCall(
+                    GET(
+                        "$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=$s",
+                        apiHeaders,
+                    ),
+                ).execute()
+                val result = resp.parseAs<ChapterDeferredResponse>()
+                if (result.success && result.data != null) {
+                    allSplits.add(result.data)
+                }
+            } catch (e: Exception) {
+                break
             }
         }
-        if (allData.isEmpty()) allData.add(firstData.data)
 
         val pages = mutableListOf<Page>()
         var index = 0
-        val seenKeys = mutableSetOf<String>()
+        val seenPieces = mutableSetOf<String>()
 
-        for (splitData in allData) {
+        for (splitData in allSplits) {
             val allPieceUrls = splitData.maps.flatMap { it.pieces }.toSet()
 
-            // الصور الكاملة أولاً
+            // الصور الكاملة - تُضاف مباشرة
             splitData.images.forEach { url ->
-                if (url !in allPieceUrls && seenKeys.add(url)) {
+                if (url !in allPieceUrls) {
                     pages.add(Page(index++, imageUrl = url))
                 }
             }
 
-            // الصور المقطعة
+            // كل map = صفحة كاملة واحدة
             splitData.maps.forEach { map ->
                 if (map.pieces.isEmpty()) return@forEach
-                val key = map.pieces.first()
-                if (!seenKeys.add(key)) return@forEach
+                if (!seenPieces.add(map.pieces.first())) return@forEach
 
-                val (cols, rows) = parseMode(map.mode, map.pieces.size)
-
-                // ترتيب القطع بشكل صحيح:
-                // order[i] = رقم القطعة التي تذهب للموضع i
-                // أي: الموضع i يأخذ القطعة pieces[order[i]]
-                val orderedPieces = Array(cols * rows) { pos ->
+                // إعادة الترتيب: الموضع i يأخذ القطعة pieces[order[i]]
+                val orderedPieces = (0 until map.pieces.size).map { pos ->
                     val srcIdx = map.order.getOrElse(pos) { pos }
                     map.pieces.getOrElse(srcIdx) { "" }.replace("&amp;", "&")
-                }
+                }.filter { it.isNotEmpty() }
 
-                when {
-                    // vertical_N → كل قطعة = صفحة مستقلة
-                    map.mode.startsWith("vertical_") -> {
-                        orderedPieces.forEach { pieceUrl ->
-                            if (pieceUrl.isNotEmpty()) {
-                                val req = MergeRequest(listOf(pieceUrl), 1, 1)
-                                pages.add(Page(index++, imageUrl = encodeRequest(req)))
-                            }
-                        }
-                    }
-                    // grid_CxR → كل صف = صفحة واحدة
-                    else -> {
-                        for (row in 0 until rows) {
-                            val rowPieces = (0 until cols).mapNotNull { col ->
-                                orderedPieces.getOrElse(row * cols + col) { "" }
-                                    .takeIf { it.isNotEmpty() }
-                            }
-                            if (rowPieces.isNotEmpty()) {
-                                val req = MergeRequest(rowPieces, cols, 1)
-                                pages.add(Page(index++, imageUrl = encodeRequest(req)))
-                            }
-                        }
-                    }
-                }
+                if (orderedPieces.isEmpty()) return@forEach
+
+                // نحدد كيفية دمج القطع حسب الـ mode
+                val (cols, rows) = parseMode(map.mode, map.pieces.size)
+
+                // كل map = صفحة واحدة بغض النظر عن grid أو vertical
+                // القطع تُدمج حسب ترتيبها الطبيعي بعد إعادة الترتيب
+                val req = MergeRequest(
+                    pieces = orderedPieces,
+                    cols = cols,
+                    rows = rows,
+                    isVertical = map.mode.startsWith("vertical_"),
+                )
+                pages.add(Page(index++, imageUrl = encodeRequest(req)))
             }
         }
 
@@ -298,27 +290,10 @@ class ProComic : HttpSource() {
         return "$SCRAMBLED_SCHEME$encoded"
     }
 
-    // بناء صورة الصفحة من القطع
     private fun buildPage(req: MergeRequest): ByteArray? {
-        // قطعة واحدة فقط - لا حاجة للدمج
-        if (req.pieces.size == 1) {
-            return runCatching {
-                val resp = client.newCall(
-                    Request.Builder()
-                        .url(req.pieces[0])
-                        .header("Referer", "$baseUrl/")
-                        .header("Accept", "image/avif,image/webp,image/*,*/*")
-                        .build(),
-                ).execute()
-                val bytes = resp.body.bytes()
-                resp.close()
-                bytes
-            }.getOrNull()
-        }
-
-        // عدة قطع - نضعها جنباً إلى جنب أفقياً
         val bitmaps = mutableListOf<Bitmap?>()
         return try {
+            // تحميل كل القطع
             for (pieceUrl in req.pieces) {
                 val resp = client.newCall(
                     Request.Builder()
@@ -336,16 +311,32 @@ class ProComic : HttpSource() {
             val valid = bitmaps.filterNotNull()
             if (valid.isEmpty()) return null
 
-            // ندمج القطع أفقياً (جنباً إلى جنب)
-            val totalW = valid.sumOf { it.width }
-            val totalH = valid.maxOf { it.height }
+            val result: Bitmap
 
-            val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(result)
-            var x = 0f
-            for (bmp in valid) {
-                canvas.drawBitmap(bmp, x, 0f, null)
-                x += bmp.width
+            if (req.isVertical || req.cols == 1) {
+                // دمج رأسي: القطع فوق بعض
+                val totalW = valid.maxOf { it.width }
+                val totalH = valid.sumOf { it.height }
+                result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(result)
+                var y = 0f
+                for (bmp in valid) {
+                    canvas.drawBitmap(bmp, 0f, y, null)
+                    y += bmp.height
+                }
+            } else {
+                // دمج في شبكة: cols × rows
+                val pieceW = valid.first().width
+                val pieceH = valid.first().height
+                val totalW = pieceW * req.cols
+                val totalH = pieceH * req.rows
+                result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(result)
+                for (i in valid.indices) {
+                    val col = i % req.cols
+                    val row = i / req.cols
+                    canvas.drawBitmap(valid[i], (col * pieceW).toFloat(), (row * pieceH).toFloat(), null)
+                }
             }
 
             val out = ByteArrayOutputStream()
@@ -391,13 +382,12 @@ class ProComic : HttpSource() {
     private inline fun <reified T> Response.parseAs(): T =
         json.decodeFromStream(body.byteStream())
 
-    // =================== Models ===================
-
     @Serializable
     data class MergeRequest(
         val pieces: List<String>,
         val cols: Int = 1,
         val rows: Int = 1,
+        val isVertical: Boolean = false,
     )
 
     @Serializable

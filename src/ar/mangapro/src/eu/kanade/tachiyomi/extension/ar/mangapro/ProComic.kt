@@ -207,14 +207,14 @@ class ProComic : HttpSource() {
 
         val apiHeaders = headers.newBuilder().set("Accept", "application/json").build()
 
-        // جلب split=0 أولاً
+        // جلب split=0 أولاً — يحتوي بيانات حقيقية ويُعطينا splitIndex
         val split0Resp = client.newCall(
             GET("$baseUrl/chapter-deferred-media/$chapterId?token=$token&split=0", apiHeaders),
         ).execute()
         val split0Data = split0Resp.parseAs<ChapterDeferredResponse>()
         if (!split0Data.success || split0Data.data == null) return emptyList()
 
-        // جمع كل splits بدءاً من 0
+        // نبدأ بـ split=0 ثم نُضيف split=1..splitIndex
         val allSplits = mutableListOf(split0Data.data)
         val totalSplits = split0Data.data.splitIndex
 
@@ -235,26 +235,32 @@ class ProComic : HttpSource() {
             }
         }
 
+        // مرحلة 1: نجمع كل URLs القطع من جميع الـ splits أولاً
+        // يمنع حذف صورة كاملة لأنها تظهر كقطعة في split آخر
+        val globalPieceUrls = allSplits
+            .flatMap { it.maps.flatMap { m -> m.pieces } }
+            .toSet()
+
         val pages = mutableListOf<Page>()
         var index = 0
-        val seenPieces = mutableSetOf<String>()
+        val seenUrls = mutableSetOf<String>() // يمنع التكرار عبر جميع الـ splits
 
+        // مرحلة 2: نبني الصفحات بالترتيب
         for (splitData in allSplits) {
-            val allPieceUrls = splitData.maps.flatMap { it.pieces }.toSet()
 
-            // الصور الكاملة - تُضاف مباشرة
+            // الصور الكاملة — نتحقق من عدم وجودها في أي map من أي split
             splitData.images.forEach { url ->
-                if (url !in allPieceUrls) {
+                if (url !in globalPieceUrls && seenUrls.add(url)) {
                     pages.add(Page(index++, imageUrl = url))
                 }
             }
 
-            // كل map = صفحة كاملة واحدة
+            // كل map = صفحة واحدة كاملة
+            // order[pos] = srcIdx : الموضع pos يعرض pieces[order[pos]]
             splitData.maps.forEach { map ->
                 if (map.pieces.isEmpty()) return@forEach
-                if (!seenPieces.add(map.pieces.first())) return@forEach
+                if (!seenUrls.add(map.pieces.first())) return@forEach
 
-                // إعادة الترتيب: الموضع i يأخذ القطعة pieces[order[i]]
                 val orderedPieces = (0 until map.pieces.size).map { pos ->
                     val srcIdx = map.order.getOrElse(pos) { pos }
                     map.pieces.getOrElse(srcIdx) { "" }.replace("&amp;", "&")
@@ -262,11 +268,7 @@ class ProComic : HttpSource() {
 
                 if (orderedPieces.isEmpty()) return@forEach
 
-                // نحدد كيفية دمج القطع حسب الـ mode
                 val (cols, rows) = parseMode(map.mode, map.pieces.size)
-
-                // كل map = صفحة واحدة بغض النظر عن grid أو vertical
-                // القطع تُدمج حسب ترتيبها الطبيعي بعد إعادة الترتيب
                 val req = MergeRequest(
                     pieces = orderedPieces,
                     cols = cols,
@@ -293,7 +295,6 @@ class ProComic : HttpSource() {
     private fun buildPage(req: MergeRequest): ByteArray? {
         val bitmaps = mutableListOf<Bitmap?>()
         return try {
-            // تحميل كل القطع
             for (pieceUrl in req.pieces) {
                 val resp = client.newCall(
                     Request.Builder()
@@ -314,7 +315,7 @@ class ProComic : HttpSource() {
             val result: Bitmap
 
             if (req.isVertical || req.cols == 1) {
-                // دمج رأسي: القطع فوق بعض
+                // دمج رأسي: القطع مكدسة فوق بعض
                 val totalW = valid.maxOf { it.width }
                 val totalH = valid.sumOf { it.height }
                 result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
@@ -325,7 +326,7 @@ class ProComic : HttpSource() {
                     y += bmp.height
                 }
             } else {
-                // دمج في شبكة: cols × rows
+                // دمج شبكي: cols × rows
                 val pieceW = valid.first().width
                 val pieceH = valid.first().height
                 val totalW = pieceW * req.cols

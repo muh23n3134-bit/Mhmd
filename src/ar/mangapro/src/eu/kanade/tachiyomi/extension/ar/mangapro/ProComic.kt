@@ -188,41 +188,61 @@ class ProComic : HttpSource() {
         val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")
         val token = jwtRegex.find(html)?.value ?: return emptyList()
 
-        val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
-            .addQueryParameter("token", token)
-            .addQueryParameter("split", "0")
-            .build()
-
-        val pagesResponse = client.newCall(
-            GET(
-                apiUrl,
-                headers.newBuilder()
-                    .set("Accept", "application/json")
-                    .set("Referer", requestUrl)
-                    .build(),
-            ),
-        ).execute()
-
-        val pagesData = pagesResponse.parseAs<ChapterDeferredResponse>()
-        if (!pagesData.success || pagesData.data == null) return emptyList()
-
         val pages = mutableListOf<Page>()
         var index = 0
 
-        // الصور الكاملة المباشرة
-        pagesData.data.images.forEach { imageUrl ->
-            pages.add(Page(index++, imageUrl = imageUrl))
-        }
+        // كل الفصل قد يتكوّن من عدة splits، نجلبها كلها
+        var splitIndex = 0
+        while (true) {
+            val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
+                .addQueryParameter("token", token)
+                .addQueryParameter("split", splitIndex.toString())
+                .build()
 
-        // كل map = صفحة واحدة مدموجة من عدة قطع
-        pagesData.data.maps.forEach { map ->
-            val encoded = Base64.encodeToString(
-                json.encodeToString(map).toByteArray(),
-                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
-            )
-            // رابط وهمي يلتقطه الـ Interceptor لدمج الصور
-            val mergedUrl = "https://merge.local/$encoded"
-            pages.add(Page(index++, imageUrl = mergedUrl))
+            val pagesResponse = try {
+                client.newCall(
+                    GET(
+                        apiUrl,
+                        headers.newBuilder()
+                            .set("Accept", "application/json")
+                            .set("Referer", requestUrl)
+                            .build(),
+                    ),
+                ).execute()
+            } catch (e: Exception) {
+                break
+            }
+
+            val pagesData = try {
+                pagesResponse.parseAs<ChapterDeferredResponse>()
+            } catch (e: Exception) {
+                break
+            }
+
+            if (!pagesData.success || pagesData.data == null) break
+
+            val data = pagesData.data
+            val hasContent = data.images.isNotEmpty() || data.maps.isNotEmpty()
+            if (!hasContent) break
+
+            // الصور الكاملة المباشرة
+            data.images.forEach { imageUrl ->
+                pages.add(Page(index++, imageUrl = imageUrl))
+            }
+
+            // كل map = صفحة واحدة مدموجة
+            data.maps.forEach { map ->
+                val encoded = Base64.encodeToString(
+                    json.encodeToString(map).toByteArray(),
+                    Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+                )
+                val mergedUrl = "https://merge.local/$encoded.jpg"
+                pages.add(Page(index++, imageUrl = mergedUrl))
+            }
+
+            splitIndex++
+            // حماية من الحلقة اللانهائية
+            if (splitIndex > 50) break
         }
 
         return pages
@@ -324,11 +344,13 @@ class ProComic : HttpSource() {
 }
 
 /**
- * Interceptor يلتقط روابط merge.local ويقوم بـ:
- * 1. فك تشفير بيانات الـ map
- * 2. تنزيل كل القطع
- * 3. دمجها في صورة واحدة حسب mode و order
- * 4. إرجاع الصورة المدموجة كاستجابة عادية
+ * Interceptor يدمج قطع الصور في صفحة واحدة كاملة.
+ *
+ * المنطق:
+ * 1. dim = [width, height] هو الأبعاد النهائية للصفحة المدموجة
+ * 2. mode يحدّد عدد الأعمدة والصفوف
+ * 3. order[i] = الفهرس الصحيح للقطعة في الموضع i (left-to-right, top-to-bottom)
+ * 4. حجم كل قطعة = (dim.width / cols) × (dim.height / rows)
  */
 class MergeImageInterceptor(private val json: Json) : Interceptor {
 
@@ -341,13 +363,19 @@ class MergeImageInterceptor(private val json: Json) : Interceptor {
         }
 
         return try {
-            val encoded = url.removePrefix("https://merge.local/")
+            val encoded = url.removePrefix("https://merge.local/").removeSuffix(".jpg")
             val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
             val map = json.decodeFromString(ProComic.PageMap.serializer(), mapJson)
 
-            // ترتيب القطع
-            val orderedUrls = if (map.order.isNotEmpty() && map.order.size == map.pieces.size) {
-                map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
+            val (cols, rows) = parseMode(map.mode, map.pieces.size)
+
+            // إعادة ترتيب القطع: orderedPieces[i] هي القطعة الصحيحة في الموضع i
+            val orderedUrls: List<String> = if (
+                map.order.isNotEmpty() &&
+                map.order.size == map.pieces.size &&
+                map.order.all { it in map.pieces.indices }
+            ) {
+                map.order.map { idx -> map.pieces[idx] }
             } else {
                 map.pieces
             }
@@ -360,21 +388,49 @@ class MergeImageInterceptor(private val json: Json) : Interceptor {
                     .build()
                 val pieceResponse = chain.proceed(pieceRequest)
                 val bytes = pieceResponse.body.bytes()
+                pieceResponse.close()
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     ?: throw Exception("فشل فك تشفير القطعة: $pieceUrl")
             }
 
-            // دمج القطع
-            val merged = mergeBitmaps(bitmaps, map.mode)
+            // الأبعاد النهائية من dim إن وُجدت، وإلا نحسبها من القطع
+            val totalW: Int
+            val totalH: Int
+            if (map.dim.size >= 2 && map.dim[0] > 0 && map.dim[1] > 0) {
+                totalW = map.dim[0]
+                totalH = map.dim[1]
+            } else {
+                totalW = bitmaps[0].width * cols
+                totalH = bitmaps[0].height * rows
+            }
 
-            // تحويل لـ JPEG
+            // دمج القطع
+            val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(result)
+
+            val cellW = totalW.toFloat() / cols
+            val cellH = totalH.toFloat() / rows
+
+            for (i in bitmaps.indices) {
+                val row = i / cols
+                val col = i % cols
+                val left = (col * cellW).toInt()
+                val top = (row * cellH).toInt()
+                val right = ((col + 1) * cellW).toInt().coerceAtMost(totalW)
+                val bottom = ((row + 1) * cellH).toInt().coerceAtMost(totalH)
+
+                val destRect = Rect(left, top, right, bottom)
+                canvas.drawBitmap(bitmaps[i], null, destRect, null)
+            }
+
+            // ضغط
             val output = ByteArrayOutputStream()
-            merged.compress(Bitmap.CompressFormat.JPEG, 90, output)
+            result.compress(Bitmap.CompressFormat.JPEG, 90, output)
             val mergedBytes = output.toByteArray()
 
             // تنظيف الذاكرة
-            bitmaps.forEach { it.recycle() }
-            merged.recycle()
+            bitmaps.forEach { if (!it.isRecycled) it.recycle() }
+            result.recycle()
 
             Response.Builder()
                 .request(request)
@@ -389,47 +445,26 @@ class MergeImageInterceptor(private val json: Json) : Interceptor {
                 .protocol(Protocol.HTTP_1_1)
                 .code(500)
                 .message("Merge failed: ${e.message}")
-                .body("".toByteArray().toResponseBody(null))
+                .body(ByteArray(0).toResponseBody(null))
                 .build()
         }
     }
 
-    private fun mergeBitmaps(pieces: List<Bitmap>, mode: String): Bitmap {
-        val (cols, rows) = parseMode(mode, pieces.size)
-
-        // افتراض أن كل القطع بنفس الأبعاد تقريباً
-        val pieceW = pieces[0].width
-        val pieceH = pieces[0].height
-
-        val totalW = pieceW * cols
-        val totalH = pieceH * rows
-
-        val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(result)
-
-        for (i in pieces.indices) {
-            val row = i / cols
-            val col = i % cols
-            val piece = pieces[i]
-            val destRect = Rect(
-                col * pieceW,
-                row * pieceH,
-                col * pieceW + pieceW,
-                row * pieceH + pieceH,
-            )
-            canvas.drawBitmap(piece, null, destRect, null)
-        }
-
-        return result
-    }
-
+    /**
+     * تحليل الـ mode إلى (cols, rows):
+     * - vertical_N → (1, N)
+     * - grid_CxR → (C, R)
+     * - horizontal_N → (N, 1)
+     */
     private fun parseMode(mode: String, piecesCount: Int): Pair<Int, Int> {
-        // grid_CxR : C أعمدة × R صفوف
-        // vertical_N : عمود واحد × N صفوف
         return when {
             mode.startsWith("vertical_") -> {
                 val n = mode.removePrefix("vertical_").toIntOrNull() ?: piecesCount
                 1 to n
+            }
+            mode.startsWith("horizontal_") -> {
+                val n = mode.removePrefix("horizontal_").toIntOrNull() ?: piecesCount
+                n to 1
             }
             mode.startsWith("grid_") -> {
                 val parts = mode.removePrefix("grid_").split("x")
@@ -440,10 +475,6 @@ class MergeImageInterceptor(private val json: Json) : Interceptor {
                 } else {
                     1 to piecesCount
                 }
-            }
-            mode.startsWith("horizontal_") -> {
-                val n = mode.removePrefix("horizontal_").toIntOrNull() ?: piecesCount
-                n to 1
             }
             else -> 1 to piecesCount
         }

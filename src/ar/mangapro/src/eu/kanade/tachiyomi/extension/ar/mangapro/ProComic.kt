@@ -1,5 +1,10 @@
 package eu.kanade.tachiyomi.extension.ar.mangapro
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Rect
+import android.util.Base64
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -9,11 +14,17 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -27,13 +38,14 @@ class ProComic : HttpSource() {
     private val json = Json { ignoreUnknownKeys = true }
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
 
-    override val client = network.cloudflareClient
+    override val client = network.cloudflareClient.newBuilder()
+        .addInterceptor(MergeImageInterceptor(json))
+        .build()
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
     // =================== Popular ===================
-
     override fun popularMangaRequest(page: Int): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
@@ -52,12 +64,10 @@ class ProComic : HttpSource() {
     }
 
     // =================== Latest ===================
-
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // =================== Search ===================
-
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$baseUrl/api/public/content/latest-updates".toHttpUrl().newBuilder()
             .addQueryParameter("limit", "30")
@@ -71,9 +81,7 @@ class ProComic : HttpSource() {
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     // =================== Details ===================
-
     override fun mangaDetailsRequest(manga: SManga): Request {
-        // manga.url = type/id/slug
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
         val id = parts.getOrElse(1) { "0" }
@@ -84,14 +92,12 @@ class ProComic : HttpSource() {
         return try {
             val data = response.parseAs<SeriesDetailResponse>()
             SManga.create().apply {
-                // نحفظ slug في url بشكل كامل: type/id/slug
                 val requestUrl = response.request.url.toString()
                 val parts = requestUrl.split("/")
                 val typeIdx = parts.indexOf("public") + 1
                 val type = parts.getOrElse(typeIdx) { "manga" }
                 val id = parts.getOrElse(typeIdx + 1) { "0" }
                 url = "$type/$id/${data.slug ?: ""}"
-
                 title = data.title ?: ""
                 thumbnail_url = data.coverImage
                 author = data.author
@@ -110,9 +116,7 @@ class ProComic : HttpSource() {
     }
 
     // =================== Chapters ===================
-
     override fun chapterListRequest(manga: SManga): Request {
-        // manga.url = type/id/slug
         val parts = manga.url.split("/")
         val type = parts.getOrElse(0) { "manga" }
         val id = parts.getOrElse(1) { "0" }
@@ -125,25 +129,15 @@ class ProComic : HttpSource() {
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        // استخراج type/id/slug من الـ referer أو الـ URL
         val requestUrl = response.request.url.toString()
         val urlParts = requestUrl.split("/")
         val publicIdx = urlParts.indexOf("public")
         val seriesType = urlParts.getOrElse(publicIdx + 1) { "manga" }
         val seriesId = urlParts.getOrElse(publicIdx + 2) { "0" }
 
-        // الـ slug محفوظ في الـ request header Referer
-        val referer = response.request.header("Referer") ?: ""
-        // نحاول استخراج slug من الـ referer
-        // referer = https://procomic.pro/ (غير مفيد هنا)
-        // سنحتاج تمريره بطريقة أخرى - نستخدم custom header
-
         val data = response.parseAs<ChaptersResponse>()
-
         return data.data.map { chapter ->
             SChapter.create().apply {
-                // url = type/seriesId/chapterId/chapterNumber
-                // الـ slug سنجلبه من mangaDetailsRequest لاحقاً
                 url = "$seriesType/$seriesId/${chapter.id}/${chapter.chapterNumber}"
                 name = "الفصل ${chapter.chapterNumber}"
                     .plus(if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else "")
@@ -157,16 +151,13 @@ class ProComic : HttpSource() {
     }
 
     // =================== Pages ===================
-
     override fun pageListRequest(chapter: SChapter): Request {
-        // chapter.url = type/seriesId/chapterId/chapterNumber
         val parts = chapter.url.split("/")
         val seriesType = parts.getOrElse(0) { "manga" }
         val seriesId = parts.getOrElse(1) { "0" }
         val chapterId = parts.getOrElse(2) { "0" }
         val chapterNum = parts.getOrElse(3) { "1" }
 
-        // نجلب slug من series details أولاً
         val slugResponse = client.newCall(
             GET("$baseUrl/api/public/$seriesType/$seriesId", headers),
         ).execute()
@@ -178,7 +169,6 @@ class ProComic : HttpSource() {
         }
 
         val htmlUrl = "$baseUrl/series/$seriesType/$seriesId/$seriesSlug/$chapterId/$chapterNum"
-
         return GET(
             htmlUrl,
             headers.newBuilder()
@@ -192,17 +182,12 @@ class ProComic : HttpSource() {
         val html = response.body.string()
         val requestUrl = response.request.url.toString()
 
-        // استخراج chapterId من URL
-        // URL: /series/{type}/{id}/{slug}/{chapterId}/{pageNum}
         val urlParts = requestUrl.split("/")
-        // chapterId هو قبل الأخير
         val chapterId = urlParts.getOrElse(urlParts.size - 2) { "0" }
 
-        // استخراج JWT Token من HTML
         val jwtRegex = Regex("""eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+""")
         val token = jwtRegex.find(html)?.value ?: return emptyList()
 
-        // جلب الصور
         val apiUrl = "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
             .addQueryParameter("token", token)
             .addQueryParameter("split", "0")
@@ -229,17 +214,15 @@ class ProComic : HttpSource() {
             pages.add(Page(index++, imageUrl = imageUrl))
         }
 
-        // الصور المقطعة - كل map = صفحة واحدة مقطعة
-        // نضعها كصور منفصلة بعد إعادة الترتيب
+        // كل map = صفحة واحدة مدموجة من عدة قطع
         pagesData.data.maps.forEach { map ->
-            val ordered = if (map.order.isNotEmpty()) {
-                map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
-            } else {
-                map.pieces
-            }
-            ordered.forEach { imageUrl ->
-                pages.add(Page(index++, imageUrl = imageUrl))
-            }
+            val encoded = Base64.encodeToString(
+                json.encodeToString(map).toByteArray(),
+                Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
+            )
+            // رابط وهمي يلتقطه الـ Interceptor لدمج الصور
+            val mergedUrl = "https://merge.local/$encoded"
+            pages.add(Page(index++, imageUrl = mergedUrl))
         }
 
         return pages
@@ -248,13 +231,11 @@ class ProComic : HttpSource() {
     override fun imageUrlParse(response: Response) = ""
 
     // =================== Helpers ===================
-
     private inline fun <reified T> Response.parseAs(): T {
         return json.decodeFromStream(body.byteStream())
     }
 
     // =================== Models ===================
-
     @Serializable
     data class LatestUpdatesResponse(
         val success: Boolean = false,
@@ -271,7 +252,6 @@ class ProComic : HttpSource() {
         val coverImageApp: CoverImageApp? = null,
     ) {
         fun toSManga() = SManga.create().apply {
-            // نخزن: type/id/slug
             url = "$type/$id/$slug"
             title = this@SeriesDto.title
             thumbnail_url = coverImageApp?.card?.mobile
@@ -336,7 +316,136 @@ class ProComic : HttpSource() {
 
     @Serializable
     data class PageMap(
+        val dim: List<Int> = emptyList(),
+        val mode: String = "",
         val pieces: List<String> = emptyList(),
         val order: List<Int> = emptyList(),
     )
+}
+
+/**
+ * Interceptor يلتقط روابط merge.local ويقوم بـ:
+ * 1. فك تشفير بيانات الـ map
+ * 2. تنزيل كل القطع
+ * 3. دمجها في صورة واحدة حسب mode و order
+ * 4. إرجاع الصورة المدموجة كاستجابة عادية
+ */
+class MergeImageInterceptor(private val json: Json) : Interceptor {
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url.toString()
+
+        if (!url.startsWith("https://merge.local/")) {
+            return chain.proceed(request)
+        }
+
+        return try {
+            val encoded = url.removePrefix("https://merge.local/")
+            val mapJson = String(Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
+            val map = json.decodeFromString(ProComic.PageMap.serializer(), mapJson)
+
+            // ترتيب القطع
+            val orderedUrls = if (map.order.isNotEmpty() && map.order.size == map.pieces.size) {
+                map.order.mapNotNull { i -> map.pieces.getOrNull(i) }
+            } else {
+                map.pieces
+            }
+
+            // تنزيل كل القطع
+            val bitmaps = orderedUrls.map { pieceUrl ->
+                val pieceRequest = Request.Builder()
+                    .url(pieceUrl)
+                    .header("Referer", "https://procomic.pro/")
+                    .build()
+                val pieceResponse = chain.proceed(pieceRequest)
+                val bytes = pieceResponse.body.bytes()
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    ?: throw Exception("فشل فك تشفير القطعة: $pieceUrl")
+            }
+
+            // دمج القطع
+            val merged = mergeBitmaps(bitmaps, map.mode)
+
+            // تحويل لـ JPEG
+            val output = ByteArrayOutputStream()
+            merged.compress(Bitmap.CompressFormat.JPEG, 90, output)
+            val mergedBytes = output.toByteArray()
+
+            // تنظيف الذاكرة
+            bitmaps.forEach { it.recycle() }
+            merged.recycle()
+
+            Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .body(mergedBytes.toResponseBody("image/jpeg".toMediaTypeOrNull()))
+                .build()
+        } catch (e: Exception) {
+            Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(500)
+                .message("Merge failed: ${e.message}")
+                .body("".toByteArray().toResponseBody(null))
+                .build()
+        }
+    }
+
+    private fun mergeBitmaps(pieces: List<Bitmap>, mode: String): Bitmap {
+        val (cols, rows) = parseMode(mode, pieces.size)
+
+        // افتراض أن كل القطع بنفس الأبعاد تقريباً
+        val pieceW = pieces[0].width
+        val pieceH = pieces[0].height
+
+        val totalW = pieceW * cols
+        val totalH = pieceH * rows
+
+        val result = Bitmap.createBitmap(totalW, totalH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(result)
+
+        for (i in pieces.indices) {
+            val row = i / cols
+            val col = i % cols
+            val piece = pieces[i]
+            val destRect = Rect(
+                col * pieceW,
+                row * pieceH,
+                col * pieceW + pieceW,
+                row * pieceH + pieceH,
+            )
+            canvas.drawBitmap(piece, null, destRect, null)
+        }
+
+        return result
+    }
+
+    private fun parseMode(mode: String, piecesCount: Int): Pair<Int, Int> {
+        // grid_CxR : C أعمدة × R صفوف
+        // vertical_N : عمود واحد × N صفوف
+        return when {
+            mode.startsWith("vertical_") -> {
+                val n = mode.removePrefix("vertical_").toIntOrNull() ?: piecesCount
+                1 to n
+            }
+            mode.startsWith("grid_") -> {
+                val parts = mode.removePrefix("grid_").split("x")
+                if (parts.size == 2) {
+                    val c = parts[0].toIntOrNull() ?: 1
+                    val r = parts[1].toIntOrNull() ?: piecesCount
+                    c to r
+                } else {
+                    1 to piecesCount
+                }
+            }
+            mode.startsWith("horizontal_") -> {
+                val n = mode.removePrefix("horizontal_").toIntOrNull() ?: piecesCount
+                n to 1
+            }
+            else -> 1 to piecesCount
+        }
+    }
 }
